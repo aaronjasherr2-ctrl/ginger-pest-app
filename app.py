@@ -2,7 +2,7 @@ import streamlit as st
 import ee
 from streamlit_js_eval import get_geolocation
 
-# 1. Page Configuration and Theming
+# 1. Page Configuration
 st.set_page_config(page_title="Ginger Early Warning - Badiangan", page_icon="🌱", layout="wide")
 
 # Connect to Earth Engine
@@ -11,108 +11,71 @@ if "gcp_service_account" in st.secrets:
     credentials = ee.ServiceAccountCredentials(secret_info["client_email"], key_data=secret_info["private_key"])
     ee.Initialize(credentials)
 
-# Professional Header with 4-H Logo (image_10.png)
-logo_url = "https://upload.wikimedia.org/wikipedia/commons/9/9f/4-H_emblem.svg" # Using a placeholder for your local logo path
-
-# CSS to enforce Green (#008F52) and White contrast for branding
+# Professional Header CSS - Fixing the 4-H Green (#008F52) theme
 st.markdown(
     """
     <style>
-    .big-title { font-size: 3rem !important; color: #008F52 !important; font-weight: bold; }
+    .big-title { font-size: 2.5rem !important; color: #008F52 !important; font-weight: bold; margin-bottom: 0; }
     .risk-high { color: #cc0000 !important; font-weight: bold; }
     .risk-low { color: #008F52 !important; font-weight: bold; }
     div[data-testid="stMetricValue"] { color: #008F52 !important; }
-    div[data-testid="stMetricLabel"] { font-size: 1.1rem !important; }
-    [data-testid="stHeader"] { background-color: rgba(0,0,0,0); }
     .stApp { background-color: #ffffff; }
     </style>
     """,
-    unsafe_allow_stdio=True
+    unsafe_allow_html=True
 )
 
-# Header with Logo
+# Header with 4-H Logo
 col_log, col_tit = st.columns([1, 5])
 with col_log:
-    st.image(logo_url, width=120)
+    # Using the official 4-H vector for high quality
+    st.image("https://upload.wikimedia.org/wikipedia/commons/9/9f/4-H_emblem.svg", width=100)
 with col_tit:
     st.markdown('<p class="big-title">Ginger Pest & Disease Early Warning System</p>', unsafe_allow_html=True)
-    st.markdown("### Decision Support System for Badiangan, Iloilo")
+    st.write("### 4-H Club Decision Support Tool | Badiangan, Iloilo")
 
 st.divider()
 
-# 2. Get GPS Location
-st.markdown("#### 📍 Field Tool")
+# 2. GPS Location Tool
 loc = get_geolocation()
-
 if loc:
-    lat = loc['coords']['latitude']
-    lon = loc['coords']['longitude']
-    st.success(f"Targeting Field: {lat:.4f}, {lon:.4f}")
+    lat, lon = loc['coords']['latitude'], loc['coords']['longitude']
+    st.success(f"📍 Analysis for coordinates: {lat:.4f}, {lon:.4f}")
 else:
-    lat, lon = 10.98, 122.50
-    st.info("GPS locating... Defaulting to Badiangan Center coordinates.")
+    lat, lon = 10.98, 122.50  # Default to Badiangan Center
+    st.info("🛰️ Waiting for GPS... Defaulting to Badiangan Town Center.")
 
-# 3. New Spatiotemporal Methodology
+# 3. Scientific Methodology (Cumulative Rain)
 def get_assessment(lati, longi):
     roi = ee.Geometry.Point([longi, lati])
+    # Analyze the last 14 days for a better vulnerability trend
+    dataset = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate('2026-04-03', '2026-04-17')
     
-    # Analyze cumulative moisture (Last 10 days) and intensity (last 24h)
-    dataset = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate('2026-04-07', '2026-04-17')
+    total_rain = dataset.sum().reduceRegion(ee.Reducer.first(), roi, 5000).getInfo().get('precipitation', 0)
+    max_rain = dataset.max().reduceRegion(ee.Reducer.first(), roi, 5000).getInfo().get('precipitation', 0)
     
-    # Last 10 days cumulative rain
-    cumulative = dataset.sum()
-    # Most intense single day in that period
-    intensity = dataset.max()
+    return total_rain, max_rain
 
-    # Reducers
-    stats_cumul = cumulative.reduceRegion(ee.Reducer.first(), roi, 5000).getInfo()
-    stats_intens = intensity.reduceRegion(ee.Reducer.first(), roi, 5000).getInfo()
-    
-    return {
-        'total': stats_cumul.get('precipitation', 0),
-        'max_day': stats_intens.get('precipitation', 0)
-    }
+total_mm, max_mm = get_assessment(lat, lon)
 
-data = get_assessment(lat, lon)
-rain_total = data['total']
-rain_max = data['max_day']
+# 4. Results Dashboard
+st.markdown("#### field vulnerability report")
+c1, c2, c3 = st.columns(3)
 
-# 4. Results Dashboard in 4-H Theme
-st.divider()
-st.markdown("#### Vulnerability Report")
+# ABE Logic: High risk if 14-day total > 50mm OR any single day > 20mm
+is_high = (total_mm > 50) or (max_mm > 20)
 
-col1, col2, col3 = st.columns(3)
+with c1:
+    status = "HIGH" if is_high else "LOW"
+    color_class = "risk-high" if is_high else "risk-low"
+    st.markdown(f"Risk Level: <p class='{color_class}' style='font-size:2.5rem; margin:0;'>{status}</p>", unsafe_allow_html=True)
 
-# Define logical threshold for Ginger in Badiangan soil types
-risk_threshold_cumul = 50.0  # >50mm cumulative
-risk_threshold_intens = 15.0 # >15mm in 24h
+with c2:
+    st.metric("14-Day Cumulative Rain", f"{total_mm:.2f} mm")
 
-is_high_risk = (rain_total > risk_threshold_cumul) or (rain_max > risk_threshold_intens)
-
-with col1:
-    status = "HIGH RISK" if is_high_risk else "LOW RISK"
-    class_name = "risk-high" if is_high_risk else "risk-low"
-    st.markdown(f"**Current Status:** <p class='{class_name}' style='font-size:3rem; margin:0;'>{status}</p>", unsafe_allow_html=True)
-    if is_high_risk:
-        st.warning("Action: Check fields for yellowing; ensure adequate soil drainage.")
-    else:
-        st.success("Safe: Standard monitoring recommended.")
-
-with col2:
-    st.metric(label="Total Moisture (Last 10 Days)", value=f"{rain_total:.2f} mm", help=f"High risk if > {risk_threshold_cumul}mm")
-
-with col3:
-    st.metric(label="Max 24h Intensity", value=f"{rain_max:.2f} mm", help=f"High risk if > {risk_threshold_intens}mm")
+with c3:
+    st.metric("Max Daily Intensity", f"{max_mm:.2f} mm")
 
 st.divider()
-# Use 4-H Green and White contrast for the map as well
-st.markdown("#### Field View")
-st.map(data={'lat': [lat], 'lon': [lon]}, zoom=12)
-
-# Footer and scientific verification
-col_fot1, col_fot2 = st.columns([1,1])
-with col_fot1:
-    st.image(logo_url, width=100)
-with col_fot2:
-    st.caption("A decision support tool for Badiangan, Iloilo. Satellite Data: CHIRPS Daily Rainfall via Google Earth Engine.")
-    st.caption("Pest Model: Cumulative and Intensity Thresholding for Rhizome Rot Risk.")
+st.map(data={'lat': [lat], 'lon': [lon]}, zoom=13)
+st.caption("Developed for Badiangan Ginger Farmers. Data powered by Google Earth Engine.")
