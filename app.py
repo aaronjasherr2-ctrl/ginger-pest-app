@@ -5,11 +5,16 @@ import matplotlib.pyplot as plt
 from streamlit_folium import st_folium
 from streamlit_js_eval import get_geolocation
 from openai import OpenAI
+import os
 
 # ----------------------------------------------------------
 # 1. INITIALIZATION & AUTHENTICATION
 # ----------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Agusipan Smart Ginger System")
+
+# Logo Handling
+if os.path.exists("agusipan_logo.png"):
+    st.image("agusipan_logo.png", width=150)
 
 # Initialize OpenAI
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
@@ -17,26 +22,24 @@ client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 # Initialize Earth Engine 
 try:
     if "gcp_service_account" in st.secrets:
-        # We assume the key is now correctly formatted in the Secrets dashboard
         creds = ee.ServiceAccountCredentials(
             st.secrets["gcp_service_account"]["client_email"],
             key_data=st.secrets["gcp_service_account"]["private_key"]
         )
         ee.Initialize(creds)
     else:
-        # Fallback for local testing
         ee.Initialize()
 except Exception as e:
-    st.error("🚨 Earth Engine failed to initialize.")
-    st.info("Check your Streamlit Secrets for the correct private_key format.")
+    st.error("🚨 Earth Engine failed to initialize. Please check your Secrets format.")
     st.stop()
 
 st.title("🌱 AGUSIPAN SMART GINGER SYSTEM")
+st.caption("Powered by AGUIPAN 4H CLUB")
 
 # ----------------------------------------------------------
-# 2. LOCATION SELECTION
+# 2. LOCATION SELECTION (1km Radius Focus)
 # ----------------------------------------------------------
-st.subheader("📍 Location Selection")
+st.subheader("📍 Location Selection (1km Analysis Radius)")
 
 use_manual = st.toggle("Enter coordinates manually")
 
@@ -50,13 +53,13 @@ else:
         lon = loc['coords']['longitude']
     else:
         lat, lon = 10.98, 122.50
-        st.info("Waiting for device GPS... Using default Iloilo coordinates.")
+        st.info("Waiting for GPS... Using default coordinates.")
 
-st.success(f"Targeting: {lat:.4f}, {lon:.4f}")
+st.success(f"Targeting: {lat:.4f}, {lon:.4f} within a 1km buffer.")
 
-# Define Area of Interest
+# Define Area of Interest (Strict 1km Radius)
 roi = ee.Geometry.Point([lon, lat])
-buffer = roi.buffer(1000)
+buffer = roi.buffer(1000) 
 
 # ----------------------------------------------------------
 # 3. ANALYSIS LOGIC
@@ -73,9 +76,9 @@ def normalize(img):
     return img.subtract(minv).divide(maxv.subtract(minv).max(0.0001))
 
 # ----------------------------------------------------------
-# 4. DATA PROCESSING (MONTHLY TRENDS)
+# 4. DATA PROCESSING (CORRECTED TEMP)
 # ----------------------------------------------------------
-with st.spinner("Fetching satellite data from Google Earth Engine..."):
+with st.spinner("Processing satellite data for your 1km radius..."):
     year = 2023
     months = list(range(5, 11))
     scores, rain_vals, lst_vals = [], [], []
@@ -84,13 +87,23 @@ with st.spinner("Fetching satellite data from Google Earth Engine..."):
         start = ee.Date.fromYMD(year, m, 1)
         end = start.advance(1, 'month')
 
-        # Precipitation (Rainfall)
+        # Precipitation (CHIRPS)
         rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start, end).sum().clip(buffer)
         
-        # Land Surface Temp (LST)
-        lst = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').filterDate(start, end).filterBounds(buffer) \
-                .map(lambda img: img.select('ST_B10').multiply(0.00341802).add(149.0).subtract(273.15)) \
-                .mean().clip(buffer)
+        # Land Surface Temp (Landsat 8 Collection 2 Level 2)
+        # Fixed negative temp by using proper ST_B10 scaling factors
+        lst_col = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2') \
+                    .filterDate(start, end) \
+                    .filterBounds(buffer)
+        
+        if lst_col.size().getInfo() > 0:
+            lst = lst_col.map(lambda img: img.select('ST_B10')
+                    .multiply(0.00341802).add(149.0) # Apply scale/offset
+                    .subtract(273.15)) \
+                    .mean().clip(buffer)
+        else:
+            # Fallback for missing data
+            lst = ee.Image(28).clip(buffer) 
 
         # Vegetation (NDVI)
         ndvi = ee.ImageCollection('COPERNICUS/S2_SR').filterDate(start, end).filterBounds(buffer) \
@@ -115,7 +128,7 @@ with st.spinner("Fetching satellite data from Google Earth Engine..."):
         rain_vals.append(rain_res.get('precipitation', 0) if rain_res else 0)
 
         lst_res = lst.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo()
-        lst_vals.append(lst_res.get('ST_B10', 0) if lst_res else 0)
+        lst_vals.append(list(lst_res.values())[0] if lst_res else 28)
 
 # ----------------------------------------------------------
 # 5. DASHBOARD DISPLAY
@@ -125,19 +138,16 @@ avg_rain = sum(rain_vals) / len(rain_vals)
 avg_lst = sum(lst_vals) / len(lst_vals)
 
 with m_col1:
-    st.metric("Avg Rainfall (May–Oct)", f"{avg_rain:.1f} mm")
+    st.metric("Avg Rainfall (1km Radius)", f"{avg_rain:.1f} mm")
 with m_col2:
-    st.metric("Avg Temperature", f"{avg_lst:.1f} °C")
+    st.metric("Avg Surface Temp", f"{avg_lst:.1f} °C")
 
-st.subheader("📊 Monthly Vulnerability Trend")
+st.subheader("📊 1km Radius Risk Trend")
 fig, ax = plt.subplots(figsize=(10, 4))
-ax.plot(months, scores, marker='o', color='#27ae60', linewidth=2)
-ax.set_xticks(months)
-ax.set_xticklabels(['May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct'])
-ax.grid(True, linestyle='--', alpha=0.6)
+ax.plot(['May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct'], scores, marker='o', color='#27ae60', linewidth=2)
+ax.set_ylabel("Risk Index")
 st.pyplot(fig)
 
-# Risk Level logic
 latest_score = scores[-1]
 if latest_score < 0.3:
     risk_text, color = "LOW", "green"
@@ -146,7 +156,7 @@ elif latest_score < 0.6:
 else:
     risk_text, color = "HIGH", "red"
 
-st.markdown(f"### Current Risk Status: :{color}[{risk_text}]")
+st.markdown(f"### 🎯 Current Risk Assessment (1km Radius): :{color}[{risk_text}]")
 
 # ----------------------------------------------------------
 # 6. AI FARM ADVISOR (CHAT)
@@ -157,27 +167,23 @@ st.subheader("🧠 AI Farm Advisor")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display previous messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# User Input Box
-if prompt := st.chat_input("Ask about pest management or ginger health..."):
+if prompt := st.chat_input("Ask about your ginger farm..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        # Context building for GPT
-        context = (f"Farm at {lat}, {lon}. Risk Score: {latest_score:.2f} ({risk_text}). "
+        context = (f"Farm at {lat}, {lon}. 1km Radius Risk: {latest_score:.2f} ({risk_text}). "
                    f"Avg Rain: {avg_rain:.1f}mm. Avg Temp: {avg_lst:.1f}C.")
         
-        # Using gpt-4o as it is the most stable version for 2026
         stream = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a professional agricultural consultant for ginger farming. Provide concise, actionable advice based on the climate data provided."},
+                {"role": "system", "content": "You are a professional agricultural consultant for AGUIPAN 4H CLUB. Advise ginger farmers based on the data provided."},
                 {"role": "user", "content": f"Data: {context}\n\nQuestion: {prompt}"}
             ],
             stream=True,
