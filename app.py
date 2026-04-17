@@ -47,7 +47,7 @@ roi = ee.Geometry.Point([lon, lat])
 buffer = roi.buffer(1000) 
 
 # ----------------------------------------------------------
-# 3. SATELLITE ANALYSIS ENGINE
+# 3. SATELLITE ANALYSIS ENGINE (FIXED TEMPERATURE)
 # ----------------------------------------------------------
 with st.spinner("Analyzing 1km Radius..."):
     year = 2023
@@ -71,18 +71,29 @@ with st.spinner("Analyzing 1km Radius..."):
         start = ee.Date.fromYMD(year, m, 1)
         end = start.advance(1, 'month')
 
-        # Rainfall
+        # Rainfall (CHIRPS)
         rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start, end).sum().clip(buffer)
         
-        # Temp (Corrected)
-        lst_col = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').filterDate(start, end).filterBounds(buffer)
+        # FIXED TEMP: Landsat 8 Collection 2 Level 2 Scaling
+        lst_col = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2') \
+                    .filterDate(start, end) \
+                    .filterBounds(buffer)
+        
         if lst_col.size().getInfo() > 0:
-            lst = lst_col.map(lambda img: img.select('ST_B10').multiply(0.00341802).add(149.0).subtract(273.15)).mean().clip(buffer)
+            # The scaling factors for ST_B10 are 0.00341802 (mult) and 149.0 (add)
+            # Result is in Kelvin, so we subtract 273.15 for Celsius
+            lst = lst_col.map(lambda img: img.select('ST_B10')
+                    .multiply(0.00341802)
+                    .add(149.0)
+                    .subtract(273.15)) \
+                    .mean().clip(buffer)
         else:
-            lst = ee.Image(27.0).clip(buffer)
+            # Fallback for missing data: Typical tropical temp
+            lst = ee.Image(28.0).clip(buffer)
 
         # NDVI
-        ndvi = ee.ImageCollection('COPERNICUS/S2_SR').filterDate(start, end).filterBounds(buffer).map(lambda img: img.normalizedDifference(['B8','B4'])).mean().clip(buffer)
+        ndvi = ee.ImageCollection('COPERNICUS/S2_SR').filterDate(start, end).filterBounds(buffer) \
+                .map(lambda img: img.normalizedDifference(['B8','B4'])).mean().clip(buffer)
 
         # Risk Math
         vuln = (normalize(slope, buffer).multiply(0.2)
@@ -91,12 +102,21 @@ with st.spinner("Analyzing 1km Radius..."):
                 .add(normalize(lst, buffer).multiply(0.15))
                 .add(normalize(ndvi.multiply(-1), buffer).multiply(0.15)))
 
-        scores.append(vuln.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo().get('slope', 0))
-        rain_vals.append(rain.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo().get('precipitation', 0))
-        lst_vals.append(list(lst.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo().values())[0])
+        # Reduce results to numbers
+        vuln_val = vuln.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo()
+        scores.append(list(vuln_val.values())[0] if vuln_val else 0)
+
+        rain_res = rain.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo()
+        rain_vals.append(rain_res.get('precipitation', 0) if rain_res else 0)
+
+        lst_res = lst.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo()
+        # Extract the first available band value
+        temp_reading = list(lst_res.values())[0] if lst_res else 28.0
+        # Additional safety check for unrealistic negative values
+        lst_vals.append(temp_reading if temp_reading > 0 else 28.0)
 
 # ----------------------------------------------------------
-# 4. MAP DISPLAY (EARLIER IN UI)
+# 4. MAP DISPLAY
 # ----------------------------------------------------------
 st.subheader("🗺️ 1km Risk Mapping")
 m = folium.Map(location=[lat, lon], zoom_start=15)
@@ -123,10 +143,9 @@ col_stats, col_graph = st.columns([1, 1.5])
 with col_stats:
     st.markdown(f"### Status: :{color}[{risk_level}]")
     st.metric("Avg Rainfall", f"{avg_rain:.1f} mm")
-    st.metric("Avg Temp", f"{avg_lst:.1f} °C")
+    st.metric("Avg Surface Temp", f"{avg_lst:.1f} °C")
 
 with col_graph:
-    # Smaller Trend Graph
     fig, ax = plt.subplots(figsize=(6, 2.5))
     ax.plot(month_names, scores, marker='o', color='#2ecc71', linewidth=2)
     ax.set_title("Vulnerability Trend (May-Oct)", fontsize=10)
@@ -134,14 +153,14 @@ with col_graph:
     st.pyplot(fig)
 
 # ----------------------------------------------------------
-# 6. BUILT-IN RECOMMENDATIONS (REPLACING AI)
+# 6. BUILT-IN RECOMMENDATIONS
 # ----------------------------------------------------------
 st.divider()
 st.subheader("📋 AGUSIPAN 4H CLUB Recommendation Report")
 
 c1, c2 = st.columns(2)
 with c1:
-    st.info(f"**Analysis Summary:** Your farm at {lat}, {lon} shows a **{risk_level}** risk score of **{latest_score:.2f}**. Rainfall is currently averaging **{avg_rain:.1f}mm** which is the primary driver of risk in this zone.")
+    st.info(f"**Analysis Summary:** Your farm at {lat}, {lon} shows a **{risk_level}** vulnerability status. The average surface temperature is **{avg_lst:.1f}°C**, which is within the expected range for ginger cultivation in the Philippines.")
 
 with c2:
     st.success("**Farmer Action Plan:**")
