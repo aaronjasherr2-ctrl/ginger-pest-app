@@ -1,4 +1,3 @@
-st.write(st.secrets)
 import streamlit as st
 import ee
 import folium
@@ -8,14 +7,14 @@ from streamlit_js_eval import get_geolocation
 from openai import OpenAI
 
 # ----------------------------------------------------------
-# INIT
+# INIT & CONFIG
 # ----------------------------------------------------------
-st.set_page_config(layout="wide")
+st.set_page_config(layout="wide", page_title="Agusipan Smart Ginger System")
 
-# OpenAI
+# 1. Setup OpenAI (Use a valid model name like 'gpt-4o')
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# Earth Engine
+# 2. Earth Engine Initialization
 if "gcp_service_account" in st.secrets:
     creds = ee.ServiceAccountCredentials(
         st.secrets["gcp_service_account"]["client_email"],
@@ -28,22 +27,24 @@ else:
 st.title("🌱 AGUSIPAN SMART GINGER SYSTEM")
 
 # ----------------------------------------------------------
-# LOCATION INPUT (NEW FEATURE)
+# LOCATION INPUT
 # ----------------------------------------------------------
 st.subheader("📍 Location Selection")
 
 use_manual = st.toggle("Enter coordinates manually")
 
 if use_manual:
-    lat = st.number_input("Latitude", value=10.98)
-    lon = st.number_input("Longitude", value=122.50)
+    lat = st.number_input("Latitude", value=10.98, format="%.4f")
+    lon = st.number_input("Longitude", value=122.50, format="%.4f")
 else:
     loc = get_geolocation()
     if loc:
         lat = loc['coords']['latitude']
         lon = loc['coords']['longitude']
     else:
+        # Fallback defaults
         lat, lon = 10.98, 122.50
+        st.info("Waiting for GPS... using default coordinates.")
 
 st.success(f"Using Location: {lat:.4f}, {lon:.4f}")
 
@@ -51,7 +52,7 @@ roi = ee.Geometry.Point([lon, lat])
 buffer = roi.buffer(1000)
 
 # ----------------------------------------------------------
-# BASE DATA
+# BASE DATA & NORMALIZATION
 # ----------------------------------------------------------
 dem = ee.Image('USGS/SRTMGL1_003').clip(buffer)
 slope = ee.Terrain.slope(dem)
@@ -65,133 +66,98 @@ def normalize(img):
     return img.subtract(minv).divide(maxv.subtract(minv).max(0.0001))
 
 # ----------------------------------------------------------
-# MONTHLY ANALYSIS (AUTO)
+# MONTHLY ANALYSIS
 # ----------------------------------------------------------
+st.info("🔄 Running Earth Engine analysis. Please wait...")
+
 year = 2023
 months = list(range(5, 11))
-
-scores = []
-rain_vals = []
-lst_vals = []
+scores, rain_vals, lst_vals = [], [], []
 
 for m in months:
-
     start = ee.Date.fromYMD(year, m, 1)
     end = start.advance(1, 'month')
 
-    rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY') \
-        .filterDate(start, end).sum().clip(buffer)
+    # Rainfall
+    rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start, end).sum().clip(buffer)
+    
+    # Temperature (LST)
+    lst = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').filterDate(start, end).filterBounds(buffer) \
+            .map(lambda img: img.select('ST_B10').multiply(0.00341802).add(149.0).subtract(273.15)) \
+            .mean().clip(buffer)
 
-    lst = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2') \
-        .filterDate(start, end) \
-        .filterBounds(buffer) \
-        .map(lambda img: img.select('ST_B10')
-             .multiply(0.00341802)
-             .add(149.0)
-             .subtract(273.15)) \
-        .mean().clip(buffer)
+    # Vegetation (NDVI)
+    ndvi = ee.ImageCollection('COPERNICUS/S2_SR').filterDate(start, end).filterBounds(buffer) \
+            .map(lambda img: img.normalizedDifference(['B8','B4'])) \
+            .mean().clip(buffer)
 
-    ndvi = ee.ImageCollection('COPERNICUS/S2_SR') \
-        .filterDate(start, end) \
-        .filterBounds(buffer) \
-        .map(lambda img: img.normalizedDifference(['B8','B4'])) \
-        .mean().clip(buffer)
-
-    # Normalize
+    # Risk Scoring
     slopeN = normalize(slope)
     twiN = normalize(twi)
     rainN = normalize(rain)
     lstN = normalize(lst)
     ndviN = normalize(ndvi.multiply(-1))
 
-    vuln = (
-        slopeN.multiply(0.2)
-        .add(twiN.multiply(0.25))
-        .add(rainN.multiply(0.25))
-        .add(lstN.multiply(0.15))
-        .add(ndviN.multiply(0.15))
-    )
+    vuln = (slopeN.multiply(0.2).add(twiN.multiply(0.25))
+            .add(rainN.multiply(0.25)).add(lstN.multiply(0.15))
+            .add(ndviN.multiply(0.15)))
 
     val = vuln.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo()
-    score = list(val.values())[0]
+    scores.append(list(val.values())[0])
 
-    scores.append(score)
-
-    rain_vals.append(
-        rain.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo().get('precipitation', 0)
-    )
-
-    lst_vals.append(
-        lst.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo().get('ST_B10', 0)
-    )
+    rain_vals.append(rain.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo().get('precipitation', 0))
+    lst_vals.append(lst.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo().get('ST_B10', 0))
 
 # ----------------------------------------------------------
-# AVERAGES
+# DASHBOARD DISPLAY
 # ----------------------------------------------------------
+col1, col2 = st.columns(2)
 avg_rain = sum(rain_vals) / len(rain_vals)
 avg_lst = sum(lst_vals) / len(lst_vals)
 
-st.metric("Avg Rainfall (May–Oct)", f"{avg_rain:.1f} mm")
-st.metric("Avg LST (May–Oct)", f"{avg_lst:.1f} °C")
+with col1:
+    st.metric("Avg Rainfall (May–Oct)", f"{avg_rain:.1f} mm")
+with col2:
+    st.metric("Avg LST (May–Oct)", f"{avg_lst:.1f} °C")
 
-# ----------------------------------------------------------
-# GRAPH (NEW)
-# ----------------------------------------------------------
 st.subheader("📊 Monthly Risk Trend")
-
 fig, ax = plt.subplots()
-ax.plot(months, scores, marker='o')
+ax.plot(months, scores, marker='o', color='#2ecc71')
 ax.set_xlabel("Month")
 ax.set_ylabel("Risk Index")
-ax.set_title("Monthly Vulnerability Trend")
-
 st.pyplot(fig)
 
-# ----------------------------------------------------------
-# CURRENT MONTH MAP (AUTO = LAST MONTH)
-# ----------------------------------------------------------
 latest_score = scores[-1]
-
-if latest_score < 0.3:
-    risk = "LOW"
-elif latest_score < 0.6:
-    risk = "MODERATE"
-else:
-    risk = "HIGH"
-
-st.subheader(f"📍 Current Risk (Latest Month): {risk}")
+risk_level = "LOW" if latest_score < 0.3 else "MODERATE" if latest_score < 0.6 else "HIGH"
+st.subheader(f"📍 Current Risk: {risk_level}")
 
 # ----------------------------------------------------------
-# GPT CHATBOT (REAL AI)
+# AI CHATBOT
 # ----------------------------------------------------------
+st.divider()
 st.subheader("🧠 AI Farm Advisor")
 
 if "chat" not in st.session_state:
     st.session_state.chat = []
 
-user_input = st.text_input("Ask your question:")
+user_input = st.chat_input("Ask about your ginger farm...")
 
 if user_input:
-
-    context = f"""
-    Location: {lat}, {lon}
-    Monthly risk scores: {scores}
-    Average rainfall: {avg_rain}
-    Average temperature: {avg_lst}
-    """
-
+    context = f"Lat: {lat}, Lon: {lon}. Monthly risk scores: {scores}. Avg rain: {avg_rain}mm. Avg temp: {avg_lst}C."
+    
+    # Note: Using 'gpt-4o' as 'gpt-5-mini' is not available
     response = client.chat.completions.create(
-        model="gpt-5-mini",
+        model="gpt-4o", 
         messages=[
             {"role": "system", "content": "You are an agricultural expert helping ginger farmers."},
-            {"role": "user", "content": context + user_input}
+            {"role": "user", "content": f"Context: {context} \nQuestion: {user_input}"}
         ]
     )
 
     reply = response.choices[0].message.content
-
     st.session_state.chat.append(("You", user_input))
     st.session_state.chat.append(("AI", reply))
 
 for speaker, msg in st.session_state.chat:
-    st.write(f"**{speaker}:** {msg}")
+    with st.chat_message("user" if speaker == "You" else "assistant"):
+        st.write(msg)
