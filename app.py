@@ -11,46 +11,39 @@ if "gcp_service_account" in st.secrets:
     credentials = ee.ServiceAccountCredentials(secret_info["client_email"], key_data=secret_info["private_key"])
     ee.Initialize(credentials)
 
-# 2. Enhanced Styling for White Background Contrast
+# 2. High-Contrast Branding CSS
 st.markdown(
     """
     <style>
-    /* Force high contrast for the white background */
     .stApp { background-color: #FFFFFF !important; }
     
-    /* AGUSIPAN 4-H CLUB Header Styling */
     .club-header { 
-        font-size: 3.5rem !important; 
+        font-size: 3rem !important; 
         color: #008F52 !important; 
         font-weight: 800; 
-        margin-bottom: -10px;
-        text-shadow: 1px 1px 2px rgba(0,0,0,0.1);
+        margin-bottom: 0px;
     }
     .sub-header { 
-        font-size: 1.5rem !important; 
+        font-size: 1.4rem !important; 
         color: #333333 !important; 
-        margin-top: 0;
-        font-weight: 400;
+        font-weight: 600;
+        margin-top: -10px;
     }
     
-    /* Metric Styling */
     div[data-testid="stMetricValue"] { color: #008F52 !important; font-weight: bold; }
-    div[data-testid="stMetricLabel"] { color: #555555 !important; }
     
-    /* Risk Status Colors */
-    .risk-high { color: #D32F2F !important; font-weight: bold; font-size: 2.5rem; }
-    .risk-low { color: #388E3C !important; font-weight: bold; font-size: 2.5rem; }
+    .risk-high { color: #D32F2F !important; font-weight: bold; font-size: 2.5rem; display: inline; }
+    .risk-low { color: #388E3C !important; font-weight: bold; font-size: 2.5rem; display: inline; }
     
-    hr { border-top: 2px solid #008F52; }
+    hr { border-top: 3px solid #008F52; }
     </style>
     """,
     unsafe_allow_html=True
 )
 
-# 3. Branding Header (Logo + Club Name)
+# 3. AGUSIPAN 4-H CLUB Header
 col_logo, col_text = st.columns([1, 4])
 with col_logo:
-    # Using a clean version of the 4-H Clover
     st.image("https://upload.wikimedia.org/wikipedia/commons/9/9f/4-H_emblem.svg", width=120)
 
 with col_text:
@@ -59,19 +52,19 @@ with col_text:
 
 st.divider()
 
-# 4. GPS & Location
+# 4. GPS Tool
 loc = get_geolocation()
 if loc:
     lat, lon = loc['coords']['latitude'], loc['coords']['longitude']
-    st.success(f"📍 Analysis running for coordinates: {lat:.4f}, {lon:.4f}")
+    st.success(f"📍 Field Coordinates Captured: {lat:.4f}, {lon:.4f}")
 else:
     lat, lon = 10.98, 122.50
-    st.info("📡 Locating your field... (Defaulting to Badiangan Center)")
+    st.info("📡 Locating field... Defaulting to Badiangan Town Center.")
 
-# 5. Scientific Logic (Last 14 Days)
+# 5. Scientific Methodology
 def get_weather_data(lati, longi):
     roi = ee.Geometry.Point([longi, lati])
-    # Fetching 14-day history to avoid the 0mm "today" error
+    # Fetching 14-day history to ensure we see the rainfall trend
     dataset = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate('2026-04-03', '2026-04-17')
     
     total = dataset.sum().reduceRegion(ee.Reducer.first(), roi, 5000).getInfo().get('precipitation', 0)
@@ -80,27 +73,29 @@ def get_weather_data(lati, longi):
 
 total_mm, peak_mm = get_weather_data(lat, lon)
 
-# 6. Dashboard Display
+# 6. Vulnerability Results
 st.markdown("### 📊 FIELD VULNERABILITY REPORT")
 c1, c2, c3 = st.columns(3)
 
-# Thresholds: High risk if total > 50mm OR peak day > 20mm
+# Thresholds for Badiangan: High risk if 14-day total > 50mm OR any day > 20mm
 is_high = (total_mm > 50) or (peak_mm > 20)
 
 with c1:
     if is_high:
-        st.markdown("**RISK LEVEL:** <p class="risk-high">HIGH</p>", unsafe_allow_html=True)
+        st.markdown(f"**RISK LEVEL:** <p class='risk-high'>HIGH</p>", unsafe_allow_html=True)
+        st.warning("Immediate field drainage inspection recommended.")
     else:
-        st.markdown("**RISK LEVEL:** <p class="risk-low">LOW</p>", unsafe_allow_html=True)
+        st.markdown(f"**RISK LEVEL:** <p class='risk-low'>LOW</p>", unsafe_allow_html=True)
+        st.success("Standard monitoring sufficient.")
 
 with c2:
-    st.metric("14-Day Total Rainfall", f"{total_mm:.2f} mm")
+    st.metric("14-Day Cumulative Rain", f"{total_mm:.2f} mm")
 
 with c3:
-    st.metric("Daily Intensity (Max)", f"{peak_mm:.2f} mm")
+    st.metric("Peak Daily Intensity", f"{peak_mm:.2f} mm")
 
 st.divider()
 
-# 7. Map & Footer
+# 7. Map
 st.map(data={'lat': [lat], 'lon': [lon]}, zoom=14)
-st.caption("Powered by Google Earth Engine | Developed for the AGUSIPAN 4-H CLUB Undergraduate Thesis Research.")
+st.caption("Developed for AGUSIPAN 4-H CLUB. Satellite Data processed via Google Earth Engine.")
