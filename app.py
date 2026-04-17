@@ -3,147 +3,197 @@ import ee
 from streamlit_js_eval import get_geolocation
 from datetime import datetime, timedelta
 
-# 1. Page Setup
-st.set_page_config(page_title="AGUSIPAN 4-H CLUB - Ginger System", page_icon="🍀", layout="wide")
+# ----------------------------------------------------------
+# 1. PAGE SETUP
+# ----------------------------------------------------------
+st.set_page_config(
+    page_title="AGUSIPAN 4-H CLUB - Ginger System",
+    page_icon="🍀",
+    layout="wide"
+)
 
-# Connect to Earth Engine
+# ----------------------------------------------------------
+# 2. CONNECT TO EARTH ENGINE
+# ----------------------------------------------------------
 if "gcp_service_account" in st.secrets:
     secret_info = st.secrets["gcp_service_account"]
-    credentials = ee.ServiceAccountCredentials(secret_info["client_email"], key_data=secret_info["private_key"])
+    credentials = ee.ServiceAccountCredentials(
+        secret_info["client_email"],
+        key_data=secret_info["private_key"]
+    )
     ee.Initialize(credentials)
 else:
-    ee.Initialize()  # Fallback for local/dev
+    ee.Initialize()
 
-# 2. High-Contrast Branding CSS
-st.markdown(
-    """
-    <style>
-    .stApp { background-color: #FFFFFF !important; }
-    .club-header {
-        font-size: 3rem !important;
-        color: #008F52 !important;
-        font-weight: 800;
-        margin-bottom: 0px;
-    }
-    .sub-header {
-        font-size: 1.4rem !important;
-        color: #333333 !important;
-        font-weight: 600;
-        margin-top: -10px;
-    }
-    div[data-testid="stMetricValue"] { color: #008F52 !important; font-weight: bold; }
-    .risk-high { color: #D32F2F !important; font-weight: bold; font-size: 2.5rem; display: inline; }
-    .risk-low { color: #388E3C !important; font-weight: bold; font-size: 2.5rem; display: inline; }
-    hr { border-top: 3px solid #008F52; }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+# ----------------------------------------------------------
+# 3. FIXED UI (WHITE BACKGROUND + READABLE TEXT)
+# ----------------------------------------------------------
+st.markdown("""
+<style>
+.stApp { background-color: #FFFFFF !important; }
 
-# 3. AGUSIPAN 4-H CLUB Header with your custom logo
+body, p, span, div, label {
+    color: #222222 !important;
+}
+
+.club-header {
+    font-size: 3rem;
+    color: #008F52;
+    font-weight: 800;
+}
+
+.sub-header {
+    font-size: 1.3rem;
+    color: #444444;
+    font-weight: 600;
+}
+
+div[data-testid="stMetricValue"] {
+    color: #008F52 !important;
+    font-weight: bold;
+}
+
+.risk-high { color: #D32F2F; font-size: 2.5rem; font-weight: bold; }
+.risk-moderate { color: #E7B416; font-size: 2.5rem; font-weight: bold; }
+.risk-low { color: #2DC937; font-size: 2.5rem; font-weight: bold; }
+
+hr { border-top: 3px solid #008F52; }
+</style>
+""", unsafe_allow_html=True)
+
+# ----------------------------------------------------------
+# 4. HEADER
+# ----------------------------------------------------------
 col_logo, col_text = st.columns([1, 4])
+
 with col_logo:
-    st.image("agusipan_logo.png", width=150)  # ← Your custom logo here
+    st.image("agusipan_logo.png", width=140)
+
 with col_text:
     st.markdown('<p class="club-header">AGUSIPAN 4-H CLUB</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Ginger Pest & Disease Early Warning System | Badiangan, Iloilo</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Ginger Pest & Disease Early Warning System</p>', unsafe_allow_html=True)
+
 st.divider()
 
-# 4. GPS Tool
+# ----------------------------------------------------------
+# 5. GPS LOCATION
+# ----------------------------------------------------------
 loc = get_geolocation()
+
 if loc:
-    lat, lon = loc['coords']['latitude'], loc['coords']['longitude']
-    st.success(f"📍 Field Coordinates Captured: {lat:.4f}, {lon:.4f}")
+    lat = loc['coords']['latitude']
+    lon = loc['coords']['longitude']
+    st.success(f"📍 Location: {lat:.4f}, {lon:.4f}")
 else:
-    lat, lon = 10.98, 122.50  # Badiangan default
-    st.info("📡 Locating field... Defaulting to Badiangan Town Center.")
+    lat, lon = 10.98, 122.50
+    st.info("📡 Using default location (Badiangan)")
 
-# 5. Improved Scientific Methodology - Multi-parameter Pattern Analysis
-def get_weather_data(lati, longi):
+# ----------------------------------------------------------
+# 6. WEATHER DATA (GEE)
+# ----------------------------------------------------------
+def get_weather(lati, longi):
     roi = ee.Geometry.Point([longi, lati])
-    
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=14)
-    start_str = start_date.strftime('%Y-%m-%d')
-    end_str = end_date.strftime('%Y-%m-%d')
-    
-    # Rainfall - CHIRPS
-    chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate(start_str, end_str)
-    total_rain = chirps.sum().reduceRegion(ee.Reducer.sum(), roi, 5000).getInfo().get('precipitation', 0)
-    max_daily_rain = chirps.max().reduceRegion(ee.Reducer.max(), roi, 5000).getInfo().get('precipitation', 0)
-    
-    # Temperature - CHIRTS (good for daily max/min)
-    chirts = ee.ImageCollection("UCSB-CHG/CHIRTS/DAILY").filterDate(start_str, end_str)
-    mean_tmax = chirts.mean().reduceRegion(ee.Reducer.mean(), roi, 5000).getInfo().get('Tmax', None)
-    mean_tmin = chirts.mean().reduceRegion(ee.Reducer.mean(), roi, 5000).getInfo().get('Tmin', None)
-    
-    # Basic humidity proxy (dewpoint depression from ERA5 if available, or simplify)
-    # For simplicity we use temperature + rain as strong proxy for disease risk
-    
-    return {
-        'total_rain': total_rain or 0,
-        'max_daily_rain': max_daily_rain or 0,
-        'mean_tmax': mean_tmax,
-        'mean_tmin': mean_tmin,
-        'start_date': start_str,
-        'end_date': end_str
-    }
 
-weather = get_weather_data(lat, lon)
+    end = datetime.now()
+    start = end - timedelta(days=14)
 
-# Risk Assessment Logic (based on ginger disease favorable conditions)
-total_mm = weather['total_rain']
-peak_mm = weather['max_daily_rain']
-tmax = weather['mean_tmax']
-tmin = weather['mean_tmin']
+    chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY") \
+        .filterDate(start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))
 
-# High risk if: heavy rain + warm temps (23-30°C optimal for many pathogens) + recent wet pattern
-is_high = (
-    (total_mm > 60) or 
-    (peak_mm > 25) or 
-    (tmax is not None and 23 <= tmax <= 32 and total_mm > 40)
+    total_rain = chirps.sum().reduceRegion(
+        ee.Reducer.sum(), roi, 5000
+    ).getInfo().get('precipitation', 0)
+
+    max_rain = chirps.max().reduceRegion(
+        ee.Reducer.max(), roi, 5000
+    ).getInfo().get('precipitation', 0)
+
+    chirts = ee.ImageCollection("UCSB-CHG/CHIRTS/DAILY") \
+        .filterDate(start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))
+
+    tmax = chirts.mean().reduceRegion(
+        ee.Reducer.mean(), roi, 5000
+    ).getInfo().get('Tmax', None)
+
+    return total_rain or 0, max_rain or 0, tmax
+
+total_mm, peak_mm, tmax = get_weather(lat, lon)
+
+# ----------------------------------------------------------
+# 7. GEE-LIKE VULNERABILITY MODEL
+# ----------------------------------------------------------
+def normalize(val, min_val, max_val):
+    if max_val - min_val == 0:
+        return 0
+    return (val - min_val) / (max_val - min_val)
+
+# Baseline (approximation of annual)
+BASE_RAIN = 120
+BASE_TEMP = 28
+
+rain_anom = total_mm / BASE_RAIN
+temp_anom = (tmax - BASE_TEMP) if tmax else 0
+
+rainN = normalize(rain_anom, 0, 2)
+tempN = normalize(temp_anom, -5, 5)
+
+veg_stress = normalize(total_mm - 30, 0, 100)
+
+# Static approximations
+slopeN = 0.5
+twiN = 0.5
+
+# Weighted model (SAME as your GEE)
+vuln = (
+    (slopeN * 0.2) +
+    (twiN * 0.25) +
+    (rainN * 0.25) +
+    (tempN * 0.15) +
+    (veg_stress * 0.15)
 )
 
-st.markdown("### 📊 FIELD VULNERABILITY REPORT (14-day pattern analysis)")
-st.caption(f"Period: {weather['start_date']} to {weather['end_date']}")
+# Classification
+if vuln < 0.3:
+    risk_label = "LOW"
+    risk_class = "risk-low"
+elif vuln < 0.6:
+    risk_label = "MODERATE"
+    risk_class = "risk-moderate"
+else:
+    risk_label = "HIGH"
+    risk_class = "risk-high"
+
+# ----------------------------------------------------------
+# 8. DISPLAY
+# ----------------------------------------------------------
+st.markdown("### 📊 FIELD VULNERABILITY REPORT")
 
 c1, c2, c3, c4 = st.columns(4)
 
 with c1:
-    if is_high:
-        st.markdown(f"**RISK LEVEL:** <p class='risk-high'>HIGH</p>", unsafe_allow_html=True)
-        st.warning("⚠️ Conditions favorable for rhizome rot, soft rot, leaf spot & bacterial wilt. Improve drainage immediately.")
+    st.markdown(f"<p class='{risk_class}'>{risk_label}</p>", unsafe_allow_html=True)
+
+    if risk_label == "HIGH":
+        st.warning("⚠️ High disease risk. Improve drainage and apply preventive measures.")
+    elif risk_label == "MODERATE":
+        st.warning("⚠️ Moderate risk. Monitor closely.")
     else:
-        st.markdown(f"**RISK LEVEL:** <p class='risk-low'>LOW</p>", unsafe_allow_html=True)
-        st.success("✅ Current patterns low risk. Continue regular monitoring.")
+        st.success("✅ Low risk. Maintain practices.")
 
 with c2:
-    st.metric("14-Day Cumulative Rain", f"{total_mm:.1f} mm", help="High cumulative rain promotes soil-borne diseases")
+    st.metric("14-Day Rainfall", f"{total_mm:.1f} mm")
+
 with c3:
-    st.metric("Peak Daily Rain", f"{peak_mm:.1f} mm", help="Heavy single-day rain increases splash dispersal of pathogens")
+    st.metric("Peak Rainfall", f"{peak_mm:.1f} mm")
+
 with c4:
-    if tmax is not None:
-        st.metric("Avg Daily Max Temp", f"{tmax:.1f} °C")
-    else:
-        st.metric("Avg Daily Max Temp", "N/A")
+    st.metric("Temperature", f"{tmax:.1f} °C" if tmax else "N/A")
 
 st.divider()
 
-# Additional insights
-st.markdown("### 🌡️ Key Environmental Insights")
-insights = []
-if total_mm > 50:
-    insights.append("High rainfall in last 14 days — favorable for fungal and bacterial diseases.")
-if tmax and 24 <= tmax <= 30:
-    insights.append("Warm temperatures (optimal range for many ginger pathogens).")
-if peak_mm > 20:
-    insights.append("Intense rain events detected — watch for waterlogging.")
+# ----------------------------------------------------------
+# 9. MAP
+# ----------------------------------------------------------
+st.map({'lat': [lat], 'lon': [lon]}, zoom=14)
 
-for insight in insights:
-    st.info(insight)
-
-st.divider()
-
-# 6. Map
-st.map(data={'lat': [lat], 'lon': [lon]}, zoom=14)
-st.caption("Developed for AGUSIPAN 4-H CLUB • Satellite Data via Google Earth Engine • Ginger disease risk based on rainfall patterns, temperature, and known pathogen favorable conditions.")
+st.caption("Powered by Google Earth Engine | AGUSIPAN 4-H CLUB")
