@@ -1,3 +1,4 @@
+st.write(st.secrets)
 import streamlit as st
 import ee
 import folium
