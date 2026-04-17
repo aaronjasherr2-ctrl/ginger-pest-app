@@ -12,25 +12,23 @@ from openai import OpenAI
 st.set_page_config(layout="wide", page_title="Agusipan Smart Ginger System")
 
 # Initialize OpenAI
-# Make sure "OPENAI_API_KEY" is in your Streamlit Secrets!
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# Initialize Earth Engine with Key-Fix
+# Initialize Earth Engine 
 try:
     if "gcp_service_account" in st.secrets:
-        # The key fix: replace literal '\n' strings with actual newlines
-        raw_key = st.secrets["gcp_service_account"]["private_key"]
-        private_key = raw_key.replace("\\n", "\n")
-        
+        # We assume the key is now correctly formatted in the Secrets dashboard
         creds = ee.ServiceAccountCredentials(
             st.secrets["gcp_service_account"]["client_email"],
-            key_data=private_key
+            key_data=st.secrets["gcp_service_account"]["private_key"]
         )
         ee.Initialize(creds)
     else:
+        # Fallback for local testing
         ee.Initialize()
 except Exception as e:
-    st.error(f"Earth Engine failed to initialize: {e}")
+    st.error("🚨 Earth Engine failed to initialize.")
+    st.info("Check your Streamlit Secrets for the correct private_key format.")
     st.stop()
 
 st.title("🌱 AGUSIPAN SMART GINGER SYSTEM")
@@ -46,23 +44,22 @@ if use_manual:
     lat = st.number_input("Latitude", value=10.98, format="%.4f")
     lon = st.number_input("Longitude", value=122.50, format="%.4f")
 else:
-    # This tries to get the browser's GPS location
     loc = get_geolocation()
     if loc:
         lat = loc['coords']['latitude']
         lon = loc['coords']['longitude']
     else:
         lat, lon = 10.98, 122.50
-        st.info("Waiting for GPS... using default coordinates for now.")
+        st.info("Waiting for device GPS... Using default Iloilo coordinates.")
 
-st.success(f"Using Location: {lat:.4f}, {lon:.4f}")
+st.success(f"Targeting: {lat:.4f}, {lon:.4f}")
 
 # Define Area of Interest
 roi = ee.Geometry.Point([lon, lat])
 buffer = roi.buffer(1000)
 
 # ----------------------------------------------------------
-# 3. ANALYSIS FUNCTIONS
+# 3. ANALYSIS LOGIC
 # ----------------------------------------------------------
 dem = ee.Image('USGS/SRTMGL1_003').clip(buffer)
 slope = ee.Terrain.slope(dem)
@@ -78,7 +75,7 @@ def normalize(img):
 # ----------------------------------------------------------
 # 4. DATA PROCESSING (MONTHLY TRENDS)
 # ----------------------------------------------------------
-with st.spinner("Analyzing satellite data..."):
+with st.spinner("Fetching satellite data from Google Earth Engine..."):
     year = 2023
     months = list(range(5, 11))
     scores, rain_vals, lst_vals = [], [], []
@@ -100,7 +97,7 @@ with st.spinner("Analyzing satellite data..."):
                 .map(lambda img: img.normalizedDifference(['B8','B4'])) \
                 .mean().clip(buffer)
 
-        # Calculate Vulnerability Index
+        # Normalize and Calculate Risk
         slopeN = normalize(slope)
         twiN = normalize(twi)
         rainN = normalize(rain)
@@ -121,28 +118,35 @@ with st.spinner("Analyzing satellite data..."):
         lst_vals.append(lst_res.get('ST_B10', 0) if lst_res else 0)
 
 # ----------------------------------------------------------
-# 5. DASHBOARD & VISUALS
+# 5. DASHBOARD DISPLAY
 # ----------------------------------------------------------
-col1, col2 = st.columns(2)
+m_col1, m_col2 = st.columns(2)
 avg_rain = sum(rain_vals) / len(rain_vals)
 avg_lst = sum(lst_vals) / len(lst_vals)
 
-with col1:
+with m_col1:
     st.metric("Avg Rainfall (May–Oct)", f"{avg_rain:.1f} mm")
-with col2:
-    st.metric("Avg Temp (May–Oct)", f"{avg_lst:.1f} °C")
+with m_col2:
+    st.metric("Avg Temperature", f"{avg_lst:.1f} °C")
 
-st.subheader("📊 Monthly Risk Trend")
-fig, ax = plt.subplots()
-ax.plot(months, scores, marker='o', color='#e67e22', linewidth=2)
+st.subheader("📊 Monthly Vulnerability Trend")
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.plot(months, scores, marker='o', color='#27ae60', linewidth=2)
 ax.set_xticks(months)
 ax.set_xticklabels(['May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct'])
-ax.set_ylabel("Risk Index")
+ax.grid(True, linestyle='--', alpha=0.6)
 st.pyplot(fig)
 
+# Risk Level logic
 latest_score = scores[-1]
-risk_level = "LOW" if latest_score < 0.3 else "MODERATE" if latest_score < 0.6 else "HIGH"
-st.subheader(f"📍 Current Vulnerability Assessment: {risk_level}")
+if latest_score < 0.3:
+    risk_text, color = "LOW", "green"
+elif latest_score < 0.6:
+    risk_text, color = "MODERATE", "orange"
+else:
+    risk_text, color = "HIGH", "red"
+
+st.markdown(f"### Current Risk Status: :{color}[{risk_text}]")
 
 # ----------------------------------------------------------
 # 6. AI FARM ADVISOR (CHAT)
@@ -153,26 +157,28 @@ st.subheader("🧠 AI Farm Advisor")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display chat history
+# Display previous messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# User Input
-if prompt := st.chat_input("Ask about ginger pests or soil health..."):
+# User Input Box
+if prompt := st.chat_input("Ask about pest management or ginger health..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        context = f"Location: {lat}, {lon}. Recent Risk Score: {latest_score:.2f}. Avg Rain: {avg_rain:.1f}mm."
+        # Context building for GPT
+        context = (f"Farm at {lat}, {lon}. Risk Score: {latest_score:.2f} ({risk_text}). "
+                   f"Avg Rain: {avg_rain:.1f}mm. Avg Temp: {avg_lst:.1f}C.")
         
-        # Use gpt-4o as a reliable production model
+        # Using gpt-4o as it is the most stable version for 2026
         stream = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a helpful agricultural expert specializing in ginger farming. Use the context provided to give advice."},
-                {"role": "user", "content": f"Context: {context}\n\nUser Question: {prompt}"}
+                {"role": "system", "content": "You are a professional agricultural consultant for ginger farming. Provide concise, actionable advice based on the climate data provided."},
+                {"role": "user", "content": f"Data: {context}\n\nQuestion: {prompt}"}
             ],
             stream=True,
         )
