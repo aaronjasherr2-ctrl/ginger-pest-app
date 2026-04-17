@@ -1,199 +1,194 @@
 import streamlit as st
 import ee
+import folium
+from streamlit_folium import st_folium
 from streamlit_js_eval import get_geolocation
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ----------------------------------------------------------
-# 1. PAGE SETUP
+# INIT
 # ----------------------------------------------------------
-st.set_page_config(
-    page_title="AGUSIPAN 4-H CLUB - Ginger System",
-    page_icon="🍀",
-    layout="wide"
-)
+st.set_page_config(layout="wide")
 
-# ----------------------------------------------------------
-# 2. CONNECT TO EARTH ENGINE
-# ----------------------------------------------------------
 if "gcp_service_account" in st.secrets:
-    secret_info = st.secrets["gcp_service_account"]
-    credentials = ee.ServiceAccountCredentials(
-        secret_info["client_email"],
-        key_data=secret_info["private_key"]
+    creds = ee.ServiceAccountCredentials(
+        st.secrets["gcp_service_account"]["client_email"],
+        key_data=st.secrets["gcp_service_account"]["private_key"]
     )
-    ee.Initialize(credentials)
+    ee.Initialize(creds)
 else:
     ee.Initialize()
 
 # ----------------------------------------------------------
-# 3. FIXED UI (WHITE BACKGROUND + READABLE TEXT)
+# UI
 # ----------------------------------------------------------
-st.markdown("""
-<style>
-.stApp { background-color: #FFFFFF !important; }
-
-body, p, span, div, label {
-    color: #222222 !important;
-}
-
-.club-header {
-    font-size: 3rem;
-    color: #008F52;
-    font-weight: 800;
-}
-
-.sub-header {
-    font-size: 1.3rem;
-    color: #444444;
-    font-weight: 600;
-}
-
-div[data-testid="stMetricValue"] {
-    color: #008F52 !important;
-    font-weight: bold;
-}
-
-.risk-high { color: #D32F2F; font-size: 2.5rem; font-weight: bold; }
-.risk-moderate { color: #E7B416; font-size: 2.5rem; font-weight: bold; }
-.risk-low { color: #2DC937; font-size: 2.5rem; font-weight: bold; }
-
-hr { border-top: 3px solid #008F52; }
-</style>
-""", unsafe_allow_html=True)
+st.title("🌱 AGUSIPAN GINGER VULNERABILITY SYSTEM")
 
 # ----------------------------------------------------------
-# 4. HEADER
-# ----------------------------------------------------------
-col_logo, col_text = st.columns([1, 4])
-
-with col_logo:
-    st.image("agusipan_logo.png", width=140)
-
-with col_text:
-    st.markdown('<p class="club-header">AGUSIPAN 4-H CLUB</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Ginger Pest & Disease Early Warning System</p>', unsafe_allow_html=True)
-
-st.divider()
-
-# ----------------------------------------------------------
-# 5. GPS LOCATION
+# LOCATION
 # ----------------------------------------------------------
 loc = get_geolocation()
 
 if loc:
     lat = loc['coords']['latitude']
     lon = loc['coords']['longitude']
-    st.success(f"📍 Location: {lat:.4f}, {lon:.4f}")
 else:
     lat, lon = 10.98, 122.50
-    st.info("📡 Using default location (Badiangan)")
+
+roi = ee.Geometry.Point([lon, lat])
+buffer = roi.buffer(1000)  # 1 KM RADIUS
 
 # ----------------------------------------------------------
-# 6. WEATHER DATA (GEE)
+# BASE DATA
 # ----------------------------------------------------------
-def get_weather(lati, longi):
-    roi = ee.Geometry.Point([longi, lati])
+dem = ee.Image('USGS/SRTMGL1_003').clip(buffer)
+slope = ee.Terrain.slope(dem)
+twi = dem.focal_mean(3).add(1).log().divide(slope.add(1))
 
-    end = datetime.now()
-    start = end - timedelta(days=14)
-
-    chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY") \
-        .filterDate(start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))
-
-    total_rain = chirps.sum().reduceRegion(
-        ee.Reducer.sum(), roi, 5000
-    ).getInfo().get('precipitation', 0)
-
-    max_rain = chirps.max().reduceRegion(
-        ee.Reducer.max(), roi, 5000
-    ).getInfo().get('precipitation', 0)
-
-    chirts = ee.ImageCollection("UCSB-CHG/CHIRTS/DAILY") \
-        .filterDate(start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))
-
-    tmax = chirts.mean().reduceRegion(
-        ee.Reducer.mean(), roi, 5000
-    ).getInfo().get('Tmax', None)
-
-    return total_rain or 0, max_rain or 0, tmax
-
-total_mm, peak_mm, tmax = get_weather(lat, lon)
+def normalize(img):
+    stats = img.reduceRegion(
+        ee.Reducer.minMax(),
+        buffer,
+        100,
+        maxPixels=1e9
+    )
+    band = img.bandNames().get(0)
+    minv = ee.Number(stats.get(ee.String(band).cat('_min')))
+    maxv = ee.Number(stats.get(ee.String(band).cat('_max')))
+    return img.subtract(minv).divide(maxv.subtract(minv).max(0.0001))
 
 # ----------------------------------------------------------
-# 7. GEE-LIKE VULNERABILITY MODEL
+# MONTH SELECTOR
 # ----------------------------------------------------------
-def normalize(val, min_val, max_val):
-    if max_val - min_val == 0:
-        return 0
-    return (val - min_val) / (max_val - min_val)
+month = st.selectbox("Select Month", [5,6,7,8,9,10])
 
-# Baseline (approximation of annual)
-BASE_RAIN = 120
-BASE_TEMP = 28
+year = 2023
+start = ee.Date.fromYMD(year, month, 1)
+end = start.advance(1, 'month')
 
-rain_anom = total_mm / BASE_RAIN
-temp_anom = (tmax - BASE_TEMP) if tmax else 0
+# ----------------------------------------------------------
+# DATA LAYERS
+# ----------------------------------------------------------
+rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY') \
+    .filterDate(start, end).sum().clip(buffer)
 
-rainN = normalize(rain_anom, 0, 2)
-tempN = normalize(temp_anom, -5, 5)
+lst = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2') \
+    .filterDate(start, end) \
+    .filterBounds(buffer) \
+    .map(lambda img: img.select('ST_B10')
+         .multiply(0.00341802)
+         .add(149.0)
+         .subtract(273.15)) \
+    .mean().clip(buffer)
 
-veg_stress = normalize(total_mm - 30, 0, 100)
+ndvi = ee.ImageCollection('COPERNICUS/S2_SR') \
+    .filterDate(start, end) \
+    .filterBounds(buffer) \
+    .map(lambda img: img.normalizedDifference(['B8','B4'])) \
+    .mean().clip(buffer)
 
-# Static approximations
-slopeN = 0.5
-twiN = 0.5
+# Normalize
+slopeN = normalize(slope)
+twiN = normalize(twi)
+rainN = normalize(rain)
+lstN = normalize(lst)
+ndviN = normalize(ndvi.multiply(-1))
 
-# Weighted model (SAME as your GEE)
+# ----------------------------------------------------------
+# VULNERABILITY MODEL
+# ----------------------------------------------------------
 vuln = (
-    (slopeN * 0.2) +
-    (twiN * 0.25) +
-    (rainN * 0.25) +
-    (tempN * 0.15) +
-    (veg_stress * 0.15)
+    slopeN.multiply(0.2)
+    .add(twiN.multiply(0.25))
+    .add(rainN.multiply(0.25))
+    .add(lstN.multiply(0.15))
+    .add(ndviN.multiply(0.15))
 )
 
-# Classification
-if vuln < 0.3:
-    risk_label = "LOW"
-    risk_class = "risk-low"
-elif vuln < 0.6:
-    risk_label = "MODERATE"
-    risk_class = "risk-moderate"
+vuln_class = (
+    ee.Image(0)
+    .where(vuln.lt(0.3), 1)
+    .where(vuln.gte(0.3).And(vuln.lt(0.6)), 2)
+    .where(vuln.gte(0.6), 3)
+).clip(buffer)
+
+# ----------------------------------------------------------
+# MAP VISUALIZATION
+# ----------------------------------------------------------
+vis = {
+    'min': 1,
+    'max': 3,
+    'palette': ['2dc937','e7b416','cc3232']
+}
+
+map_id = vuln_class.getMapId(vis)
+
+m = folium.Map(location=[lat, lon], zoom_start=14)
+
+folium.TileLayer(
+    tiles=map_id['tile_fetcher'].url_format,
+    attr='GEE',
+    name='Vulnerability'
+).add_to(m)
+
+folium.Circle([lat, lon], radius=1000, color='blue', fill=False).add_to(m)
+
+folium.LayerControl().add_to(m)
+
+st_folium(m, width=700, height=500)
+
+# ----------------------------------------------------------
+# LEGEND
+# ----------------------------------------------------------
+st.markdown("""
+### Legend
+🟢 Low  
+🟡 Moderate  
+🔴 High  
+""")
+
+# ----------------------------------------------------------
+# RISK VALUE (MEAN INSIDE 1KM)
+# ----------------------------------------------------------
+mean_val = vuln.reduceRegion(
+    ee.Reducer.mean(),
+    buffer,
+    100
+).getInfo()
+
+score = list(mean_val.values())[0]
+
+if score < 0.3:
+    risk = "LOW"
+elif score < 0.6:
+    risk = "MODERATE"
 else:
-    risk_label = "HIGH"
-    risk_class = "risk-high"
+    risk = "HIGH"
+
+st.subheader(f"📍 1km Radius Risk: {risk} ({score:.2f})")
 
 # ----------------------------------------------------------
-# 8. DISPLAY
+# EXPORT
 # ----------------------------------------------------------
-st.markdown("### 📊 FIELD VULNERABILITY REPORT")
-
-c1, c2, c3, c4 = st.columns(4)
-
-with c1:
-    st.markdown(f"<p class='{risk_class}'>{risk_label}</p>", unsafe_allow_html=True)
-
-    if risk_label == "HIGH":
-        st.warning("⚠️ High disease risk. Improve drainage and apply preventive measures.")
-    elif risk_label == "MODERATE":
-        st.warning("⚠️ Moderate risk. Monitor closely.")
-    else:
-        st.success("✅ Low risk. Maintain practices.")
-
-with c2:
-    st.metric("14-Day Rainfall", f"{total_mm:.1f} mm")
-
-with c3:
-    st.metric("Peak Rainfall", f"{peak_mm:.1f} mm")
-
-with c4:
-    st.metric("Temperature", f"{tmax:.1f} °C" if tmax else "N/A")
-
-st.divider()
+if st.button("Download GeoTIFF"):
+    task = ee.batch.Export.image.toDrive(
+        image=vuln_class,
+        description='Ginger_Vulnerability',
+        scale=30,
+        region=buffer,
+        maxPixels=1e9
+    )
+    task.start()
+    st.success("Export started! Check your Google Drive.")
 
 # ----------------------------------------------------------
-# 9. MAP
+# SIMPLE AI ADVISOR
 # ----------------------------------------------------------
-st.map({'lat': [lat], 'lon': [lon]}, zoom=14)
+st.subheader("🤖 AI Advisor")
 
-st.caption("Powered by Google Earth Engine | AGUSIPAN 4-H CLUB")
+if risk == "HIGH":
+    st.warning("Improve drainage, apply fungicide, avoid waterlogging.")
+elif risk == "MODERATE":
+    st.info("Monitor field, improve aeration.")
+else:
+    st.success("Low risk, maintain practices.")
