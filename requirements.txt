@@ -2,3 +2,5 @@ streamlit
 earthengine-api
 geemap
 streamlit-js-eval
+folium
+streamlit-folium
