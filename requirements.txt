@@ -1,10 +1,7 @@
 streamlit
 earthengine-api
-geemap
+folium
+streamlit-folium
 streamlit-js-eval
-folium
-streamlit-folium
-folium
-streamlit-folium
 openai
 matplotlib
