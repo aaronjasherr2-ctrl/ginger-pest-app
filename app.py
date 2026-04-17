@@ -17,7 +17,8 @@ if os.path.exists("agusipan_logo.png"):
     st.image("agusipan_logo.png", width=150)
 
 # Initialize OpenAI
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+# Note: Ensure OPENAI_API_KEY is correctly set in Streamlit Secrets
+client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY", "missing_key"))
 
 # Initialize Earth Engine 
 try:
@@ -34,7 +35,7 @@ except Exception as e:
     st.stop()
 
 st.title("🌱 AGUSIPAN SMART GINGER SYSTEM")
-st.caption("Powered by AGUIPAN 4H CLUB")
+st.caption("Powered by AGUSIPAN 4H CLUB")
 
 # ----------------------------------------------------------
 # 2. LOCATION SELECTION (1km Radius Focus)
@@ -57,69 +58,59 @@ else:
 
 st.success(f"Targeting: {lat:.4f}, {lon:.4f} within a 1km buffer.")
 
-# Define Area of Interest (Strict 1km Radius)
+# Define Area of Interest
 roi = ee.Geometry.Point([lon, lat])
 buffer = roi.buffer(1000) 
 
 # ----------------------------------------------------------
 # 3. ANALYSIS LOGIC
 # ----------------------------------------------------------
-dem = ee.Image('USGS/SRTMGL1_003').clip(buffer)
-slope = ee.Terrain.slope(dem)
-twi = dem.focal_mean(3).add(1).log().divide(slope.add(1))
-
-def normalize(img):
-    stats = img.reduceRegion(ee.Reducer.minMax(), buffer, 100, maxPixels=1e9)
+def normalize(img, area):
+    stats = img.reduceRegion(ee.Reducer.minMax(), area, 100, maxPixels=1e9)
     band = img.bandNames().get(0)
     minv = ee.Number(stats.get(ee.String(band).cat('_min')))
     maxv = ee.Number(stats.get(ee.String(band).cat('_max')))
     return img.subtract(minv).divide(maxv.subtract(minv).max(0.0001))
 
 # ----------------------------------------------------------
-# 4. DATA PROCESSING (CORRECTED TEMP)
+# 4. DATA PROCESSING
 # ----------------------------------------------------------
-with st.spinner("Processing satellite data for your 1km radius..."):
+with st.spinner("Analyzing satellite data for your 1km radius..."):
     year = 2023
     months = list(range(5, 11))
     scores, rain_vals, lst_vals = [], [], []
+
+    # Static layers
+    dem = ee.Image('USGS/SRTMGL1_003').clip(buffer)
+    slope = ee.Terrain.slope(dem)
+    twi = dem.focal_mean(3).add(1).log().divide(slope.add(1))
 
     for m in months:
         start = ee.Date.fromYMD(year, m, 1)
         end = start.advance(1, 'month')
 
-        # Precipitation (CHIRPS)
+        # Precipitation
         rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start, end).sum().clip(buffer)
         
-        # Land Surface Temp (Landsat 8 Collection 2 Level 2)
-        # Fixed negative temp by using proper ST_B10 scaling factors
-        lst_col = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2') \
-                    .filterDate(start, end) \
-                    .filterBounds(buffer)
+        # Land Surface Temp (Corrected Scaling)
+        lst_col = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').filterDate(start, end).filterBounds(buffer)
         
         if lst_col.size().getInfo() > 0:
-            lst = lst_col.map(lambda img: img.select('ST_B10')
-                    .multiply(0.00341802).add(149.0) # Apply scale/offset
-                    .subtract(273.15)) \
-                    .mean().clip(buffer)
+            lst = lst_col.map(lambda img: img.select('ST_B10').multiply(0.00341802).add(149.0).subtract(273.15)).mean().clip(buffer)
         else:
-            # Fallback for missing data
             lst = ee.Image(28).clip(buffer) 
 
-        # Vegetation (NDVI)
-        ndvi = ee.ImageCollection('COPERNICUS/S2_SR').filterDate(start, end).filterBounds(buffer) \
-                .map(lambda img: img.normalizedDifference(['B8','B4'])) \
-                .mean().clip(buffer)
+        # NDVI
+        ndvi = ee.ImageCollection('COPERNICUS/S2_SR').filterDate(start, end).filterBounds(buffer).map(lambda img: img.normalizedDifference(['B8','B4'])).mean().clip(buffer)
 
-        # Normalize and Calculate Risk
-        slopeN = normalize(slope)
-        twiN = normalize(twi)
-        rainN = normalize(rain)
-        lstN = normalize(lst)
-        ndviN = normalize(ndvi.multiply(-1))
+        # Risk Calculation
+        slopeN = normalize(slope, buffer)
+        twiN = normalize(twi, buffer)
+        rainN = normalize(rain, buffer)
+        lstN = normalize(lst, buffer)
+        ndviN = normalize(ndvi.multiply(-1), buffer)
 
-        vuln = (slopeN.multiply(0.2).add(twiN.multiply(0.25))
-                .add(rainN.multiply(0.25)).add(lstN.multiply(0.15))
-                .add(ndviN.multiply(0.15)))
+        vuln = (slopeN.multiply(0.2).add(twiN.multiply(0.25)).add(rainN.multiply(0.25)).add(lstN.multiply(0.15)).add(ndviN.multiply(0.15)))
 
         res = vuln.reduceRegion(ee.Reducer.mean(), buffer, 1000).getInfo()
         scores.append(list(res.values())[0] if res else 0)
@@ -149,44 +140,32 @@ ax.set_ylabel("Risk Index")
 st.pyplot(fig)
 
 latest_score = scores[-1]
-if latest_score < 0.3:
-    risk_text, color = "LOW", "green"
-elif latest_score < 0.6:
-    risk_text, color = "MODERATE", "orange"
-else:
-    risk_text, color = "HIGH", "red"
+risk_text = "LOW" if latest_score < 0.3 else "MODERATE" if latest_score < 0.6 else "HIGH"
+color = "green" if risk_text == "LOW" else "orange" if risk_text == "MODERATE" else "red"
 
 st.markdown(f"### 🎯 Current Risk Assessment (1km Radius): :{color}[{risk_text}]")
 
 # ----------------------------------------------------------
-# 6. AI FARM ADVISOR (CHAT)
+# 6. AI AUTOMATED RECOMMENDATIONS
 # ----------------------------------------------------------
 st.divider()
-st.subheader("🧠 AI Farm Advisor")
+st.subheader("🧠 AGUSIPAN AI Farmer's Recommendation")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+try:
+    context = (f"Location: {lat}, {lon}. Risk Level: {risk_text} (Score: {latest_score:.2f}). "
+               f"Avg Rainfall: {avg_rain:.1f}mm. Avg Surface Temperature: {avg_lst:.1f}C. "
+               f"Months Analyzed: May to October.")
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a professional agricultural expert for AGUSIPAN 4H CLUB. Summarize the risk and give clear, bulleted recommendations for ginger farmers based on the data provided."},
+            {"role": "user", "content": f"Please summarize these findings and give advice: {context}"}
+        ]
+    )
+    
+    st.write(response.choices[0].message.content)
 
-if prompt := st.chat_input("Ask about your ginger farm..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        context = (f"Farm at {lat}, {lon}. 1km Radius Risk: {latest_score:.2f} ({risk_text}). "
-                   f"Avg Rain: {avg_rain:.1f}mm. Avg Temp: {avg_lst:.1f}C.")
-        
-        stream = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a professional agricultural consultant for AGUIPAN 4H CLUB. Advise ginger farmers based on the data provided."},
-                {"role": "user", "content": f"Data: {context}\n\nQuestion: {prompt}"}
-            ],
-            stream=True,
-        )
-        response = st.write_stream(stream)
-    st.session_state.messages.append({"role": "assistant", "content": response})
+except Exception as ai_err:
+    st.warning("⚠️ Could not generate AI recommendations. Please check your OpenAI API key and billing status.")
+    st.error(f"Error details: {ai_err}")
