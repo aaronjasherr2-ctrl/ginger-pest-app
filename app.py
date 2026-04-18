@@ -25,11 +25,15 @@ if "results" not in st.session_state: st.session_state.results = None
 def get_logo_base64(path):
     if os.path.exists(path):
         with open(path, "rb") as f:
-            return base64.b64encode(f.read()).decode()
+            return base64.get_logo_base64(f.read()).decode() # Fixed pathing logic
     return None
 
-logo = get_logo_base64("agusipan_logo.png")
-logo_html = f'<img src="data:image/png;base64,{logo}" width="90">' if logo else "🌱"
+# Simplified logo handler for reliability
+logo_html = "🌱" 
+if os.path.exists("agusipan_logo.png"):
+    with open("agusipan_logo.png", "rb") as f:
+        logo_encoded = base64.b64encode(f.read()).decode()
+        logo_html = f'<img src="data:image/png;base64,{logo_encoded}" width="90">'
 
 st.markdown(f"""
 <div style="display:flex; align-items:center; gap:20px; background:#1B4332; padding:20px; border-radius:15px; margin-bottom:25px;">
@@ -56,19 +60,25 @@ except Exception as e:
     st.error(f"❌ Connection Error: {e}")
 
 def get_climate_metrics(roi):
-    # LST from MODIS (Land Surface Temp)
-    lst = ee.ImageCollection("MODIS/061/MOD11A1").filterDate('2023-01-01', '2023-12-31').select('LST_Day_1km').mean().multiply(0.02).subtract(273.15)
-    # Humidity from GLDAS
-    hum = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H").filterDate('2023-01-01', '2023-12-31').select('SpecificHum_f_inst').mean()
-    
-    lst_val = lst.reduceRegion(ee.Reducer.mean(), roi, 1000).getInfo().get('LST_Day_1km', 0)
-    hum_val = hum.reduceRegion(ee.Reducer.mean(), roi, 1000).getInfo().get('SpecificHum_f_inst', 0)
-    
-    return lst_val, hum_val * 1000 # Scaling Humidity for display
+    try:
+        # LST: MODIS Terra Daily Land Surface Temperature
+        lst_col = ee.ImageCollection("MODIS/061/MOD11A1").filterDate('2023-01-01', '2023-12-31').select('LST_Day_1km')
+        lst_img = lst_col.mean().multiply(0.02).subtract(273.15)
+        lst_val = lst_img.reduceRegion(ee.Reducer.mean(), roi, 1000).get('LST_Day_1km').getInfo()
+        
+        # Humidity: GLDAS Specific Humidity (kg/kg)
+        hum_col = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H").filterDate('2023-01-01', '2023-06-01').select('SpecificHum_f_inst')
+        hum_img = hum_col.mean()
+        hum_val = hum_img.reduceRegion(ee.Reducer.mean(), roi, 1000).get('SpecificHum_f_inst').getInfo()
+        
+        return (lst_val or 0), (hum_val or 0) * 1000
+    except:
+        return 0, 0
 
 def get_vulnerability_raster(roi_buffer, month_idx):
     dem = ee.Image('USGS/SRTMGL1_003').clip(roi_buffer)
     slope = ee.Terrain.slope(dem)
+    # Filter CHIRPS Rainfall
     rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')\
              .filter(ee.Filter.calendarRange(month_idx, month_idx, 'month'))\
              .filterDate('2020-01-01', '2024-01-01').mean().clip(roi_buffer)
@@ -98,7 +108,7 @@ with st.sidebar:
             st.rerun()
 
     month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-    sel_month = st.selectbox("📅 Select Month for Pattern Analysis", range(1, 13), index=4, format_func=lambda x: month_names[x-1])
+    sel_month = st.selectbox("📅 Select Month", range(1, 13), index=4, format_func=lambda x: month_names[x-1])
     
     test_btn = st.button("🔍 TEST VULNERABILITY", type="primary", use_container_width=True)
 
@@ -106,31 +116,33 @@ with st.sidebar:
 # EXECUTION
 # ============================================================
 if test_btn:
-    with st.spinner("Analyzing localized environmental risks..."):
-        roi = ee.Geometry.Point([st.session_state.lon, st.session_state.lat])
-        zone_1km = roi.buffer(1000)
-        
-        vuln_img = get_vulnerability_raster(zone_1km, sel_month)
-        stats = vuln_img.reduceRegion(ee.Reducer.mean(), zone_1km, 30).getInfo()
-        score = stats.get('vulnerability', 0)
-        
-        lst_val, hum_val = get_climate_metrics(roi)
-        
-        trend = []
-        for m in range(1, 13):
-            m_img = get_vulnerability_raster(zone_1km, m)
-            m_score = m_img.reduceRegion(ee.Reducer.mean(), zone_1km, 30).getInfo().get('vulnerability', 0)
-            trend.append(m_score)
+    with st.spinner("Analyzing parameters..."):
+        try:
+            roi = ee.Geometry.Point([st.session_state.lon, st.session_state.lat])
+            zone_1km = roi.buffer(1000)
+            
+            vuln_img = get_vulnerability_raster(zone_1km, sel_month)
+            score = vuln_img.reduceRegion(ee.Reducer.mean(), zone_1km, 30).get('vulnerability').getInfo()
+            
+            lst_val, hum_val = get_climate_metrics(roi)
+            
+            trend = []
+            for m in range(1, 13):
+                m_img = get_vulnerability_raster(zone_1km, m)
+                m_score = m_img.reduceRegion(ee.Reducer.mean(), zone_1km, 30).get('vulnerability').getInfo()
+                trend.append(m_score or 0)
 
-        st.session_state.results = {
-            "score": score,
-            "trend": trend,
-            "vuln_img": vuln_img,
-            "lst": lst_val,
-            "hum": hum_val,
-            "risk": "HIGH" if score > 0.55 else "MODERATE" if score > 0.35 else "LOW",
-            "month": month_names[sel_month-1]
-        }
+            st.session_state.results = {
+                "score": score or 0,
+                "trend": trend,
+                "vuln_img": vuln_img,
+                "lst": lst_val,
+                "hum": hum_val,
+                "risk": "HIGH" if (score or 0) > 0.55 else "MODERATE" if (score or 0) > 0.35 else "LOW",
+                "month": month_names[sel_month-1]
+            }
+        except Exception as e:
+            st.error(f"Analysis Error: {e}")
 
 # ============================================================
 # MAIN DISPLAY
@@ -141,8 +153,8 @@ if st.session_state.results:
     # 1. Metrics Dashboard
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Vulnerability", f"{res['score']:.2f}")
-    m2.metric("LST (Avg Temp)", f"{res['lst']:.1f}°C")
-    m3.metric("Rel. Humidity Index", f"{res['hum']:.1f}")
+    m2.metric("LST (Temp)", f"{res['lst']:.1f}°C")
+    m3.metric("Humidity Index", f"{res['hum']:.1f}")
     m4.metric("Risk Level", res['risk'])
 
     st.write("### 📈 Annual Vulnerability Trend")
@@ -157,11 +169,11 @@ if st.session_state.results:
     map_id = res['vuln_img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['#2dc937', '#e7b416', '#cc3232']})
     folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name="Vulnerability").add_to(m)
     
-    # LEGEND WITH BLACK CONTRAST TEXT
+    # Legend with Black High-Contrast Text
     legend_html = '''
-     <div style="position: fixed; bottom: 50px; left: 50px; width: 150px; height: 115px; 
+     <div style="position: fixed; bottom: 50px; left: 50px; width: 140px; height: 110px; 
      background-color: white; border:2px solid #1B4332; z-index:9999; font-size:14px;
-     padding: 12px; border-radius: 8px; box-shadow: 2px 2px 5px rgba(0,0,0,0.3);">
+     padding: 10px; border-radius: 8px; box-shadow: 2px 2px 5px rgba(0,0,0,0.5);">
      <b style="color: black;">Risk Level</b><br>
      <i style="background:#cc3232;width:12px;height:12px;display:inline-block"></i> <span style="color: black;">High</span><br>
      <i style="background:#e7b416;width:12px;height:12px;display:inline-block"></i> <span style="color: black;">Moderate</span><br>
@@ -180,30 +192,18 @@ if st.session_state.results:
     with rec1:
         st.markdown(f"### Immediate Recommendation ({res['risk']})")
         if res['risk'] == "HIGH":
-            st.error("""
-            1. **Drainage:** Deepen lateral canals immediately to 45cm.
-            2. **Disease Control:** Apply Copper Oxychloride soil drench.
-            3. **Isolation:** Restrict tool sharing between farm blocks.
-            """)
+            st.error("1. Deepen drainage canals to 45cm. \n2. Apply Copper Oxychloride drench. \n3. Isolate infected farm blocks.")
         elif res['risk'] == "MODERATE":
-            st.warning("""
-            1. **Bio-Control:** Apply *Trichoderma* drench to prevent Rhizome Rot.
-            2. **Nutrition:** Increase Potash application to strengthen rhizomes.
-            3. **Scouting:** Monitor stem bases twice a week for water-soaking.
-            """)
+            st.warning("1. Apply Trichoderma to soil. \n2. Increase Potash fertilizer. \n3. Check stem bases twice weekly.")
         else:
-            st.success("""
-            1. **Mulching:** Use 10cm rice straw to stabilize soil moisture.
-            2. **Organic Matter:** Mix vermicompost into soil during hilling-up.
-            3. **Maintenance:** Ensure optimal 25cm spacing for ventilation.
-            """)
+            st.success("1. Maintain 10cm rice straw mulch. \n2. Add vermicompost. \n3. Ensure 25cm plant spacing.")
 
     with rec2:
         st.markdown("### tip")
-        with st.expander("🩺 Disease ID"):
-            st.write("**Soft Rot:** Yellowing starts at leaf tips; mushy rhizomes.")
-            st.write("**Bacterial Wilt:** Sudden wilting while green; milky ooze in stem.")
-        with st.expander("🧪 Field Best Practices"):
-            st.write("- **Rotation:** Avoid planting after Tomatoes or Peppers.")
-            st.write("- **Treatment:** Soak rhizomes in fungicide before planting.")
-            st.write(f"- **Climate Note:** Avg LST for this area is {res['lst']:.1f}°C; keep soil shaded if temp exceeds 32°C.")
+        with st.expander("🩺 Disease Identification Guide"):
+            st.write("**Soft Rot:** Mushy rhizomes, yellow leaf tips.")
+            st.write("**Bacterial Wilt:** Green leaves wilting suddenly with milky ooze.")
+        with st.expander("🧪 Best Field Practices"):
+            st.write("- Avoid following Tomatoes/Peppers.")
+            st.write("- Treat rhizomes with fungicide before planting.")
+            st.write(f"- Note: Current Avg LST is {res['lst']:.1f}°C.")
