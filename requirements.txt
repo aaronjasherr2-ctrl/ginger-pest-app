@@ -3,5 +3,6 @@ earthengine-api
 folium
 streamlit-folium
 streamlit-js-eval
-openai
-matplotlib
+pandas
+plotly
+requests
