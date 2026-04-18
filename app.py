@@ -1,3 +1,21 @@
+st.markdown("""
+    <style>
+    .main {
+        background-color: #f5f7f9;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 28px;
+        color: #2e7d32;
+    }
+    div[data-testid="metric-container"] {
+        background-color: white;
+        border: 1px solid #e0e0e0;
+        padding: 15px;
+        border-radius: 15px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+    }
+    </style>
+    """, unsafe_allow_html=True)
 import streamlit as st
 import ee
 import folium
