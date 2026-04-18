@@ -53,36 +53,38 @@ except Exception as e:
     st.error(f"❌ Connection Error: {e}")
 
 def get_historical_climate(roi, month_idx):
-    """Calculates LST and Humidity based on historical patterns (2020-2024)"""
+    """Patterns from 2000 to 2026 (Latest Available)"""
     try:
-        # 1. Historical LST (MODIS 6.1)
+        # Historical LST (MODIS 6.1) - Starts Feb 2000
         lst_col = ee.ImageCollection("MODIS/061/MOD11A1")\
             .filter(ee.Filter.calendarRange(month_idx, month_idx, 'month'))\
-            .filterDate('2020-01-01', '2024-12-31')\
+            .filterDate('2000-01-01', '2026-04-01')\
             .select('LST_Day_1km')
         
         lst_img = lst_col.mean().multiply(0.02).subtract(273.15)
         lst_val = lst_img.reduceRegion(ee.Reducer.mean(), roi, 1000).get('LST_Day_1km').getInfo()
         
-        # 2. Historical Specific Humidity (GLDAS)
+        # Historical Humidity (GLDAS 2.1) - 2000 to Present
         hum_col = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H")\
             .filter(ee.Filter.calendarRange(month_idx, month_idx, 'month'))\
-            .filterDate('2020-01-01', '2024-12-31')\
-            .select('Qair_f_inst') # Standard band for Specific Humidity
+            .filterDate('2000-01-01', '2026-04-01')\
+            .select('Qair_f_inst')
         
         hum_img = hum_col.mean()
         hum_val = hum_img.reduceRegion(ee.Reducer.mean(), roi, 1000).get('Qair_f_inst').getInfo()
         
-        return (lst_val or 0), (hum_val or 0) * 1000 # Scaling for display
+        return (lst_val or 0), (hum_val or 0) * 1000 
     except:
         return 0, 0
 
 def get_vulnerability_raster(roi_buffer, month_idx):
+    """Rainfall patterns 2000-2026"""
     dem = ee.Image('USGS/SRTMGL1_003').clip(roi_buffer)
     slope = ee.Terrain.slope(dem)
+    
     rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')\
              .filter(ee.Filter.calendarRange(month_idx, month_idx, 'month'))\
-             .filterDate('2020-01-01', '2024-12-31').mean().clip(roi_buffer)
+             .filterDate('2000-01-01', '2026-04-01').mean().clip(roi_buffer)
 
     slope_norm = slope.divide(45)
     rain_norm = rain.divide(500)
@@ -116,16 +118,14 @@ with st.sidebar:
 # EXECUTION
 # ============================================================
 if test_btn:
-    with st.spinner("Analyzing past patterns (2020-2024)..."):
+    with st.spinner("Analyzing 25-year historical patterns..."):
         try:
             roi = ee.Geometry.Point([st.session_state.lon, st.session_state.lat])
             zone_1km = roi.buffer(1000)
             
-            # Vulnerability analysis
             vuln_img = get_vulnerability_raster(zone_1km, sel_month)
             score = vuln_img.reduceRegion(ee.Reducer.mean(), zone_1km, 30).get('vulnerability').getInfo()
             
-            # Climate patterns analysis
             lst_val, hum_val = get_historical_climate(roi, sel_month)
             
             trend = []
@@ -152,11 +152,11 @@ if st.session_state.results:
     # Dashboard Metrics
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Vulnerability Index", f"{res['score']:.2f}")
-    m2.metric("Historical LST", f"{res['lst']:.1f}°C")
-    m3.metric("Historical Humidity", f"{res['hum']:.1f}")
-    m4.metric("Calculated Risk", res['risk'])
+    m2.metric("Long-term LST", f"{res['lst']:.1f}°C")
+    m3.metric("Long-term Humidity", f"{res['hum']:.1f}")
+    m4.metric("Risk Level", res['risk'])
 
-    st.write(f"### 📈 Annual Vulnerability Pattern for {res['month']}")
+    st.write(f"### 📈 Annual Pattern (Historical Average 2000-2026)")
     df = pd.DataFrame(res['trend'], index=month_names, columns=['Risk Score'])
     st.line_chart(df, color="#1B4332")
 
@@ -167,7 +167,7 @@ if st.session_state.results:
     map_id = res['vuln_img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['#2dc937', '#e7b416', '#cc3232']})
     folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name="Vulnerability").add_to(m)
     
-    # Legend (High Contrast)
+    # Legend
     legend_html = '''
      <div style="position: fixed; bottom: 50px; left: 50px; width: 140px; height: 110px; 
      background-color: white; border:2px solid #1B4332; z-index:9999; font-size:14px;
@@ -182,7 +182,7 @@ if st.session_state.results:
     folium.Marker([st.session_state.lat, st.session_state.lon]).add_to(m)
     st_folium(m, width="100%", height=500)
 
-    # UPDATED SECTION HEADERS
+    # Recommendations
     st.markdown("---")
     st.subheader("Recommendations")
     rec1, rec2 = st.columns(2)
@@ -199,9 +199,9 @@ if st.session_state.results:
     with rec2:
         st.markdown("### tip")
         with st.expander("🩺 Disease Information"):
-            st.write("**Soft Rot:** Yellow leaf tips; mushy stems.")
-            st.write("**Bacterial Wilt:** Sudden green wilting; milky ooze inside the stem.")
+            st.write("**Soft Rot:** Mushy rhizomes, yellow leaf tips.")
+            st.write("**Bacterial Wilt:** Sudden wilting while green; milky ooze.")
         with st.expander("🧪 Field Best Practices"):
-            st.write("- Avoid following Tomato or Pepper crops.")
-            st.write("- Pre-treat seed rhizomes with fungicide.")
-            st.write(f"- Climate Alert: Historical Avg LST is {res['lst']:.1f}°C.")
+            st.write("- Never plant ginger after Tomato or Peppers.")
+            st.write("- Treat rhizomes with fungicide before planting.")
+            st.write(f"- Historical Average Temperature: {res['lst']:.1f}°C.")
