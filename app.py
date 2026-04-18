@@ -6,27 +6,43 @@ import plotly.express as px
 from streamlit_folium import st_folium
 from streamlit_js_eval import get_geolocation
 import os
+import base64
 
 # ============================================================
 # PAGE CONFIG
 # ============================================================
-st.set_page_config(layout="wide", page_title="Ginger Pest Warning")
+st.set_page_config(layout="wide", page_title="Ginger Warning System")
 
-# Session State
+# Initialize Session States
 if "lat" not in st.session_state: st.session_state.lat = 10.9300
 if "lon" not in st.session_state: st.session_state.lon = 122.5200
 if "results" not in st.session_state: st.session_state.results = None
 
-# Header
+# ============================================================
+# BRANDING & LOGO
+# ============================================================
+def get_base64_logo(path):
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    return None
+
+logo_b64 = get_base64_logo("agusipan_logo.png")
+logo_html = f'<img src="data:image/png;base64,{logo_b64}" width="85" style="vertical-align: middle;">' if logo_b64 else "🌱"
+
+# Header Section
 st.markdown(f"""
-<div style="background:#1B4332; padding:20px; border-radius:15px; color:white; margin-bottom:20px;">
-    <h1 style="margin:0;">🌱 Agusipan Ginger Warning System</h1>
-    <p style="margin:0; opacity:0.8;">Precision Monitoring: 1km Farm Analysis Zone</p>
+<div style="display:flex; align-items:center; gap:25px; background:linear-gradient(135deg, #1B4332 0%, #2D6A4F 100%); padding:25px; border-radius:15px; color:white; margin-bottom:25px; box-shadow: 0 4px 15px rgba(0,0,0,0.2);">
+    {logo_html}
+    <div>
+        <h1 style="margin:0; font-size:36px; letter-spacing:1px; display:inline-block; vertical-align:middle;">Ginger Warning System</h1>
+        <p style="margin:8px 0 0 0; font-size:18px; opacity:0.9; font-weight: 500;">Monitoring System designed by Agusipan 4H Club</p>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
 # ============================================================
-# EARTH ENGINE & LOCATION
+# EARTH ENGINE INITIALIZATION
 # ============================================================
 try:
     if "gcp_service_account" in st.secrets:
@@ -37,110 +53,115 @@ try:
     else:
         ee.Initialize()
 except Exception as e:
-    st.error(f"Earth Engine Error: {e}")
-
-# Auto-Detect Location
-loc = get_geolocation()
-if loc:
-    st.session_state.lat = loc['coords']['latitude']
-    st.session_state.lon = loc['coords']['longitude']
-
-col_a, col_b = st.columns([2,1])
-with col_a:
-    st.info(f"📍 **Monitoring Farm at:** Lat {st.session_state.lat:.4f}, Lon {st.session_state.lon:.4f}")
-with col_b:
-    with st.expander("Change Location Manually"):
-        st.session_state.lat = st.number_input("Lat", value=st.session_state.lat, format="%.4f")
-        st.session_state.lon = st.number_input("Lon", value=st.session_state.lon, format="%.4f")
+    st.error(f"⚠️ Earth Engine Connection Failed: {e}")
 
 # ============================================================
-# ANALYSIS (1KM RADIUS)
+# DATA ANALYSIS ENGINE
 # ============================================================
 def perform_analysis(lat, lon):
     roi = ee.Geometry.Point([lon, lat])
-    zone_1km = roi.buffer(1000)
+    zone = roi.buffer(1000) # 1km Zone
     
-    # Terrain & Rainfall Data
-    slope = ee.Terrain.slope(ee.Image('USGS/SRTMGL1_003')).clip(zone_1km)
-    rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate('2023-01-01', '2023-12-31').sum().clip(zone_1km)
+    # 1. Rainfall (CHIRPS)
+    rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate('2023-01-01', '2023-12-31').sum().clip(zone)
     
-    # Risk Logic (Slope + Rain Weighting)
-    risk_img = slope.divide(45).multiply(0.4).add(rain.divide(3500).multiply(0.6)).rename('risk')
+    # 2. LST - Land Surface Temperature (Landsat 8)
+    lst_col = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2") \
+                .filterBounds(zone) \
+                .filterDate('2023-01-01', '2023-12-31') \
+                .sort('CLOUD_COVER')
     
-    # Data for Stats
-    s_val = slope.reduceRegion(ee.Reducer.mean(), zone_1km, 30).getInfo().get('slope')
-    r_val = rain.reduceRegion(ee.Reducer.mean(), zone_1km, 30).getInfo().get('precipitation')
-    score = risk_img.reduceRegion(ee.Reducer.mean(), zone_1km, 30).getInfo().get('risk')
+    lst_img = ee.Image(lst_col.first()).select('ST_B10')
+    # Scale to Celsius: (Value * 0.00341802 + 149) - 273.15
+    lst_c = lst_img.multiply(0.00341802).add(149).subtract(273.15).clip(zone)
     
-    return risk_img, s_val, r_val, score
+    # 3. Terrain
+    slope = ee.Terrain.slope(ee.Image('USGS/SRTMGL1_003')).clip(zone)
+    
+    # 4. Pest Risk Index (Combination of High Moisture and Temperature Stress)
+    pest_risk = rain.divide(3000).multiply(0.5).add(lst_c.divide(35).multiply(0.5)).rename('pest_index')
 
-if st.button("🚀 Analyze 1km Zone", use_container_width=True, type="primary"):
-    with st.spinner("Calculating risk factors..."):
-        r_img, s_v, r_v, sc = perform_analysis(st.session_state.lat, st.session_state.lon)
-        st.session_state.results = {"score": sc, "slope": s_v, "rain": r_v, "img": r_img}
+    # Stats
+    stats = {
+        "rain": rain.reduceRegion(ee.Reducer.mean(), zone, 30).getInfo().get('precipitation'),
+        "lst": lst_c.reduceRegion(ee.Reducer.mean(), zone, 30).getInfo().get('ST_B10'),
+        "pest": pest_risk.reduceRegion(ee.Reducer.mean(), zone, 30).getInfo().get('pest_index')
+    }
+    
+    return pest_risk, stats
 
 # ============================================================
-# RESULTS DASHBOARD
+# MAIN UI
+# ============================================================
+# Auto-detect location via browser GPS
+loc = get_geolocation()
+if loc:
+    st.session_state.lat, st.session_state.lon = loc['coords']['latitude'], loc['coords']['longitude']
+
+st.info(f"📍 **Analyzing Coordinates:** Lat {st.session_state.lat:.4f}, Lon {st.session_state.lon:.4f}")
+
+if st.button("🚀 Start 1km Analysis", type="primary", use_container_width=True):
+    with st.spinner("Processing Raster Imagery..."):
+        p_map, s_data = perform_analysis(st.session_state.lat, st.session_state.lon)
+        st.session_state.results = {"stats": s_data, "map": p_map}
+
+# ============================================================
+# DASHBOARD DISPLAY
 # ============================================================
 if st.session_state.results:
-    res = st.session_state.results
-    risk_cat = "HIGH" if res['score'] > 0.6 else "MEDIUM" if res['score'] > 0.35 else "LOW"
+    res = st.session_state.results['stats']
+    p_map = st.session_state.results['map']
     
-    # Metrics
+    # METRICS
     m1, m2, m3 = st.columns(3)
-    m1.metric("Pest Risk Level", risk_cat)
-    m2.metric("Avg Slope", f"{res['slope']:.1f}°")
-    m3.metric("Annual Rain", f"{res['rain']:.0f} mm")
+    m1.metric("Pest Risk Index", f"{res['pest']:.2f}")
+    m2.metric("Average Rainfall", f"{res['rain']:.0f} mm")
+    m3.metric("Avg LST (Temp)", f"{res['lst']:.1f} °C")
 
     st.markdown("---")
 
-    # Dual Maps & Graph
-    map_col1, map_col2, graph_col = st.columns([1, 1, 1])
+    # MAP & GRAPH
+    col_left, col_right = st.columns([2, 1])
 
-    with map_col1:
-        st.write("🗺️ **Locator Map**")
-        m1 = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=15)
-        folium.Marker([st.session_state.lat, st.session_state.lon]).add_to(m1)
-        st_folium(m1, height=300, width=None, key="locator")
+    with col_left:
+        st.write("🗺️ **1km Vulnerability Raster Map**")
+        m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=14)
+        
+        # Add Pest Risk Layer
+        map_id = p_map.getMapId({'min': 0.3, 'max': 0.7, 'palette': ['#2dc937', '#e7b416', '#cc3232']})
+        folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name="Vulnerability").add_to(m)
 
-    with map_col2:
-        st.write("🎯 **1km Risk Zone**")
-        m2 = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=14)
-        v_id = res['img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['#2dc937', '#e7b416', '#cc3232']})
-        folium.TileLayer(tiles=v_id['tile_fetcher'].url_format, attr='GEE', name="Risk Zone").add_to(m2)
-        st_folium(m2, height=300, width=None, key="risk_zone")
+        # High Contrast Legend
+        legend_html = '''
+             <div style="position: fixed; bottom: 50px; left: 50px; width: 180px; height: auto; 
+             background-color: white; border:2px solid #1B4332; z-index:9999; font-size:13px;
+             padding: 10px; border-radius: 5px; color: black;">
+             <b>Vulnerability Legend</b><br>
+             <i style="background: #cc3232; width: 12px; height: 12px; float: left; margin-right: 8px;"></i> High Risk<br>
+             <i style="background: #e7b416; width: 12px; height: 12px; float: left; margin-right: 8px;"></i> Moderate Risk<br>
+             <i style="background: #2dc937; width: 12px; height: 12px; float: left; margin-right: 8px;"></i> Low Risk<br>
+             </div>'''
+        m.get_root().html.add_child(folium.Element(legend_html))
+        st_folium(m, width="100%", height=450, key="v_map")
 
-    with graph_col:
-        st.write("📊 **Risk Breakdown**")
+    with col_right:
+        st.write("📊 **Factor Breakdown**")
         df = pd.DataFrame({
-            "Source": ["Slope", "Rainfall", "Total Risk"],
-            "Intensity": [res['slope']/45, res['rain']/3500, res['score']]
+            "Indicator": ["Pest Risk", "Moisture", "Temp Stress"],
+            "Value": [res['pest'], res['rain']/3500, res['lst']/45]
         })
-        fig = px.bar(df, x="Source", y="Intensity", color="Source", range_y=[0,1],
-                     color_discrete_map={"Slope":"#2A9D8F", "Rainfall":"#264653", "Total Risk":"#E76F51"})
+        fig = px.bar(df, x="Indicator", y="Value", color="Indicator", range_y=[0,1],
+                     color_discrete_map={"Pest Risk":"#cc3232", "Moisture":"#2A9D8F", "Temp Stress":"#E9C46A"})
         st.plotly_chart(fig, use_container_width=True)
 
-    # Simplified Recommendations
-    st.markdown("### 📋 Farm Action Plan")
-    rec_box = st.container()
+    # ============================================================
+    # MANUAL RECOMMENDATIONS
+    # ============================================================
+    st.markdown("### 📋 Recommended Farm Actions")
     
-    if risk_cat == "HIGH":
-        st.error("🚨 **High Alert:** Immediate action required for crop safety.")
-        st.markdown("""
-        * **Manual Task:** Dig deep 'V' canals around rows to shed water.
-        * **Treatment:** Apply organic fungicide/biocontrol to roots.
-        * **Monitoring:** Check for wilting leaves every morning.
-        """)
-    elif risk_cat == "MEDIUM":
-        st.warning("⚠️ **Warning:** Weather conditions are risky.")
-        st.markdown("""
-        * **Manual Task:** Apply mulch to stabilize soil moisture.
-        * **Treatment:** Ensure proper organic fertilization to build plant strength.
-        * **Monitoring:** Inspect the base of stems twice a week.
-        """)
+    if res['pest'] > 0.6:
+        st.error(f"**🔴 High Alert:** High risk detected. Deepen drainage canals to 30cm to prevent Soft Rot. Apply organic fungicides immediately.")
+    elif res['pest'] > 0.4:
+        st.warning(f"**🟡 Moderate Caution:** Conditions favor pest growth. Increase scouting to twice a week. Ensure no standing water remains after rain.")
     else:
-        st.success("✅ **Safe:** Maintain current farming practices.")
-        st.markdown("""
-        * **Manual Task:** Keep rows clean of weeds for better airflow.
-        * **Monitoring:** Regular weekly scouting for general pests.
-        """)
+        st.success(f"**🟢 Low Risk:** Environmental conditions are favorable. Maintain current mulching and weeding schedule.")
