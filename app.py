@@ -7,36 +7,28 @@ from streamlit_folium import st_folium
 from streamlit_js_eval import get_geolocation
 
 # ----------------------------------------------------------
-# 🛠️ LOGO DECODER
+# LOGO
 # ----------------------------------------------------------
-def get_base64_of_bin_file(bin_file):
-    if os.path.exists(bin_file):
-        with open(bin_file, 'rb') as f:
-            return base64.b64encode(f.read()).decode()
+def get_logo_base64(path):
+    if os.path.exists(path):
+        return base64.b64encode(open(path, "rb").read()).decode()
     return None
 
-# ----------------------------------------------------------
-# 🎨 UI
-# ----------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Ginger Pest Warning System")
 
-logo_base64 = get_base64_of_bin_file("agusipan_logo.png")
-logo_tag = f'<img src="data:image/png;base64,{logo_base64}" width="70">' if logo_base64 else "🌱"
+logo = get_logo_base64("agusipan_logo.png")
+logo_html = f'<img src="data:image/png;base64,{logo}" width="70">' if logo else "🌱"
 
 st.markdown(f"""
 <style>
-.main {{ background-color: #081c15; color: #D8F3DC; }}
-.header-container {{
-    display:flex; align-items:center;
-    background:rgba(27,67,50,0.8);
-    padding:20px; border-radius:20px;
-}}
-.header-text {{ margin-left:20px; }}
+body {{ background:#081c15; color:#D8F3DC; }}
+.header {{ display:flex; align-items:center; gap:15px;
+background:rgba(27,67,50,0.8); padding:15px; border-radius:15px; }}
 </style>
 
-<div class="header-container">
-{logo_tag}
-<div class="header-text">
+<div class="header">
+{logo_html}
+<div>
 <h2>Ginger Pest Warning System</h2>
 <p>Agusipan 4H CLUB MONITORING DASHBOARD</p>
 </div>
@@ -44,38 +36,39 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ----------------------------------------------------------
-# 🌍 INIT EE
+# INIT EE
 # ----------------------------------------------------------
 def init_ee():
     if "ee_init" not in st.session_state:
-        if "gcp_service_account" in st.secrets:
-            info = st.secrets["gcp_service_account"]
-            creds = ee.ServiceAccountCredentials(
-                info["client_email"],
-                key_data=info["private_key"]
-            )
-            ee.Initialize(creds, project=info["project_id"])
-        else:
-            ee.Initialize()
-        st.session_state.ee_init = True
+        try:
+            if "gcp_service_account" in st.secrets:
+                info = st.secrets["gcp_service_account"]
+                creds = ee.ServiceAccountCredentials(
+                    info["client_email"],
+                    key_data=info["private_key"]
+                )
+                ee.Initialize(creds, project=info["project_id"])
+            else:
+                ee.Initialize()
+            st.session_state.ee_init = True
+        except Exception as e:
+            st.error(f"EE Init Error: {e}")
+            st.stop()
 
 init_ee()
 
 # ----------------------------------------------------------
-# 📍 SIDEBAR
+# SIDEBAR
 # ----------------------------------------------------------
 with st.sidebar:
     loc = get_geolocation()
     lat = st.number_input("Latitude", value=loc['coords']['latitude'] if loc else 10.73)
     lon = st.number_input("Longitude", value=loc['coords']['longitude'] if loc else 122.54)
-
-    months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-    m = st.selectbox("Month", range(1,13), format_func=lambda x: months[x-1])
-
+    month = st.selectbox("Month", range(1,13))
     run = st.button("Run Analysis")
 
 # ----------------------------------------------------------
-# 📊 CACHE SAFE DATA ONLY
+# SAFE ANALYSIS (NO IMAGE IN CACHE)
 # ----------------------------------------------------------
 @st.cache_data
 def get_data(lat, lon):
@@ -85,79 +78,105 @@ def get_data(lat, lon):
     dem = ee.Image('USGS/SRTMGL1_003').clip(buffer)
     slope = ee.Terrain.slope(dem)
 
-    results = []
+    out = []
 
-    for i in range(1,13):
-        start = ee.Date.fromYMD(2023, i, 1)
+    for m in range(1,13):
+        start = ee.Date.fromYMD(2023, m, 1)
         end = start.advance(1, 'month')
 
-        rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start,end).sum()
+        rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')\
+                .filterDate(start,end).sum().clip(buffer)
 
         vuln = slope.divide(30).multiply(0.3)\
-                .add(rain.divide(500).multiply(0.7))
+               .add(rain.divide(500).multiply(0.7))\
+               .rename("vuln")  # 🔥 FIX: ensure band exists
 
-        score = vuln.reduceRegion(ee.Reducer.mean(), buffer, 100).getInfo()
-        rain_val = rain.reduceRegion(ee.Reducer.mean(), buffer,100).getInfo()
+        try:
+            score = vuln.reduceRegion(
+                ee.Reducer.mean(), buffer, 100
+            ).getInfo().get("vuln", 0.5)
+        except:
+            score = 0.5
 
-        results.append({
-            "score": score.get('slope',0.5),
-            "rain": rain_val.get('precipitation',0)
-        })
+        try:
+            rain_val = rain.reduceRegion(
+                ee.Reducer.mean(), buffer, 100
+            ).getInfo().get("precipitation", 0)
+        except:
+            rain_val = 0
 
-    return results
+        out.append({"score": score, "rain": rain_val})
+
+    return out
 
 # ----------------------------------------------------------
-# 🧠 REBUILD IMAGE (NOT CACHED)
+# BUILD IMAGE SAFELY
 # ----------------------------------------------------------
-def build_vuln_image(lat, lon, month):
+def build_image(lat, lon, m):
     roi = ee.Geometry.Point([lon, lat])
     buffer = roi.buffer(1000)
 
     dem = ee.Image('USGS/SRTMGL1_003').clip(buffer)
     slope = ee.Terrain.slope(dem)
 
-    start = ee.Date.fromYMD(2023, month, 1)
+    start = ee.Date.fromYMD(2023, m, 1)
     end = start.advance(1, 'month')
 
-    rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start,end).sum()
+    rain_col = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')\
+                .filterDate(start,end)
+
+    # 🔥 fallback if empty
+    rain = ee.Image(
+        ee.Algorithms.If(
+            rain_col.size().gt(0),
+            rain_col.sum(),
+            ee.Image.constant(0)
+        )
+    )
 
     vuln = slope.divide(30).multiply(0.3)\
-            .add(rain.divide(500).multiply(0.7))\
-            .clip(buffer)
+           .add(rain.divide(500).multiply(0.7))\
+           .rename("vuln")\
+           .clip(buffer)
 
     return vuln
 
 # ----------------------------------------------------------
-# 🚀 RUN
+# RUN
 # ----------------------------------------------------------
 if run or "data" in st.session_state:
 
     if "data" not in st.session_state:
-        st.session_state.data = get_data(lat, lon)
+        with st.spinner("Processing..."):
+            st.session_state.data = get_data(lat, lon)
 
-    data = st.session_state.data[m-1]
+    d = st.session_state.data[month-1]
 
-    st.metric("🌧 Rainfall", f"{data['rain']:.1f} mm")
+    st.metric("🌧 Rainfall", f"{d['rain']:.1f} mm")
 
-    score = data['score']
-    risk = "HIGH" if score>0.6 else "MODERATE" if score>0.35 else "LOW"
+    risk = "HIGH" if d['score']>0.6 else "MODERATE" if d['score']>0.35 else "LOW"
     st.metric("⚠ Risk", risk)
 
     # ------------------------------------------------------
-    # 🗺️ MAP
+    # MAP
     # ------------------------------------------------------
-    vuln_img = build_vuln_image(lat, lon, m)
-
     mapp = folium.Map(location=[lat, lon], zoom_start=15)
 
-    vis = {'min':0,'max':0.8,'palette':['green','yellow','red']}
+    try:
+        img = build_image(lat, lon, month)
 
-    map_id = vuln_img.getMapId(vis)
+        vis = {'min':0,'max':0.8,'palette':['green','yellow','red']}
 
-    folium.TileLayer(
-        tiles=map_id['tile_fetcher'].url_format,
-        attr='EE',
-        overlay=True
-    ).add_to(mapp)
+        map_id = img.getMapId(vis)
+
+        folium.TileLayer(
+            tiles=map_id['tile_fetcher'].url_format,
+            attr='EE',
+            overlay=True
+        ).add_to(mapp)
+
+    except Exception as e:
+        st.error("Map rendering failed")
+        st.warning(str(e))
 
     st_folium(mapp, width=1200, height=500)
