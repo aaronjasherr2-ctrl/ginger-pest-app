@@ -61,32 +61,29 @@ def analyze_high_precision(lat, lon, sel_month):
     roi = ee.Geometry.Point([lon, lat])
     zone_500m = roi.buffer(500)
     
-    # 1. High-Precision Terrain (Scale set to 10m for maximum detail)
+    # 1. High-Precision Terrain (10m scale)
     dem = ee.Image('USGS/SRTMGL1_003').clip(zone_500m)
     slope = ee.Terrain.slope(dem)
-    # Using scale 10 to capture micro-topography shifts
     slope_val = slope.reduceRegion(ee.Reducer.mean(), zone_500m, 10).get('slope').getInfo() or 0
     
     # 2. Historical Climate (2000-2026)
     rain_col = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD").filterDate('2000-01-01', '2026-12-31')
     
     trend = []
-    # Fetch monthly climatology with bicubic resampling for smoother precision
     sel_rain = rain_col.filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).mean().resample('bicubic')
     sel_rain_val = sel_rain.reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('precipitation').getInfo() or 0
 
     for m in range(1, 13):
         m_rain = rain_col.filter(ee.Filter.calendarRange(m, m, 'month')).mean()
         m_rain_val = m_rain.reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('precipitation').getInfo() or 0
-        # Refined Vulnerability Formula
         v_score = (slope_val / 45 * 0.45) + (m_rain_val / 10 * 0.55)
         trend.append(min(v_score, 1.0))
 
-    # 3. Precision Raster (10m scale rendering)
+    # 3. Precision Raster (10m scale)
     rain_map = rain_col.filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).mean().clip(zone_500m)
     vuln_raster = slope.divide(45).multiply(0.45).add(rain_map.divide(10).multiply(0.55)).rename('vulnerability')
     
-    # 4. Long-term LST (1km resolution resampled to 500m zone)
+    # 4. Long-term LST
     lst_col = ee.ImageCollection("MODIS/061/MOD11A1").filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).select('LST_Day_1km')
     lst_val = lst_col.mean().multiply(0.02).subtract(273.15).reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('LST_Day_1km').getInfo() or 0
     
@@ -112,7 +109,6 @@ with st.sidebar:
             st.rerun()
 
     with st.expander("⌨️ Manual Coordinate Entry"):
-        # Increased decimal step for high precision entry
         mlat = st.number_input("Latitude", value=st.session_state.lat, format="%.8f", step=0.000001)
         mlon = st.number_input("Longitude", value=st.session_state.lon, format="%.8f", step=0.000001)
         if st.button("Apply Coordinates"):
@@ -143,7 +139,6 @@ if st.session_state.results:
     res = st.session_state.results
     
     m1, m2, m3, m4 = st.columns(4)
-    # Showing 3 decimal places for index precision
     m1.metric("Local Vulnerability", f"{res['score']:.3f}")
     m2.metric("Long-term LST", f"{res['lst']:.1f}°C")
     m3.metric("Humidity Index", f"{res['hum']:.2f}")
@@ -154,10 +149,10 @@ if st.session_state.results:
     st.line_chart(df, color="#1B4332")
 
     st.markdown("---")
-    st.subheader("🎯 High-Resolution Vulnerability Raster (500m)")
+    # UPDATED HEADING: RISK MAP
+    st.subheader("🎯 RISK MAP (500m)")
     m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=17) 
     
-    # Raster display with high-precision palette
     map_id = res['vuln_img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['#2dc937', '#92d050', '#e7b416', '#cc3232']})
     folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name="Precision Risk").add_to(m)
     
