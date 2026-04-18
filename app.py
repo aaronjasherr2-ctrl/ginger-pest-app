@@ -55,16 +55,24 @@ try:
 except Exception as e:
     st.error(f"❌ Connection Error: {e}")
 
+def get_climate_metrics(roi):
+    # LST from MODIS (Land Surface Temp)
+    lst = ee.ImageCollection("MODIS/061/MOD11A1").filterDate('2023-01-01', '2023-12-31').select('LST_Day_1km').mean().multiply(0.02).subtract(273.15)
+    # Humidity from GLDAS
+    hum = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H").filterDate('2023-01-01', '2023-12-31').select('SpecificHum_f_inst').mean()
+    
+    lst_val = lst.reduceRegion(ee.Reducer.mean(), roi, 1000).getInfo().get('LST_Day_1km', 0)
+    hum_val = hum.reduceRegion(ee.Reducer.mean(), roi, 1000).getInfo().get('SpecificHum_f_inst', 0)
+    
+    return lst_val, hum_val * 1000 # Scaling Humidity for display
+
 def get_vulnerability_raster(roi_buffer, month_idx):
     dem = ee.Image('USGS/SRTMGL1_003').clip(roi_buffer)
     slope = ee.Terrain.slope(dem)
-    
-    # Historical Rain for the selected month
     rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')\
              .filter(ee.Filter.calendarRange(month_idx, month_idx, 'month'))\
              .filterDate('2020-01-01', '2024-01-01').mean().clip(roi_buffer)
 
-    # Normalize and combine (60% Rain, 40% Slope)
     slope_norm = slope.divide(45)
     rain_norm = rain.divide(500)
     vuln = slope_norm.multiply(0.4).add(rain_norm.multiply(0.6)).rename('vulnerability')
@@ -106,7 +114,8 @@ if test_btn:
         stats = vuln_img.reduceRegion(ee.Reducer.mean(), zone_1km, 30).getInfo()
         score = stats.get('vulnerability', 0)
         
-        # Monthly trend for graph
+        lst_val, hum_val = get_climate_metrics(roi)
+        
         trend = []
         for m in range(1, 13):
             m_img = get_vulnerability_raster(zone_1km, m)
@@ -117,7 +126,8 @@ if test_btn:
             "score": score,
             "trend": trend,
             "vuln_img": vuln_img,
-            "zone_1km": zone_1km,
+            "lst": lst_val,
+            "hum": hum_val,
             "risk": "HIGH" if score > 0.55 else "MODERATE" if score > 0.35 else "LOW",
             "month": month_names[sel_month-1]
         }
@@ -128,78 +138,72 @@ if test_btn:
 if st.session_state.results:
     res = st.session_state.results
     
-    # 1. Dashboard Summary
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.metric(label="Current Vulnerability Score", value=f"{res['score']:.2f}")
-        st.subheader(f"Status: {res['risk']}")
-        st.write(f"Analyzed Pattern for: **{res['month']}**")
-        
-    with col2:
-        st.write("### 📈 Annual Vulnerability Trend")
-        df = pd.DataFrame(res['trend'], index=month_names, columns=['Risk Score'])
-        st.line_chart(df, color="#1B4332")
+    # 1. Metrics Dashboard
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Vulnerability", f"{res['score']:.2f}")
+    m2.metric("LST (Avg Temp)", f"{res['lst']:.1f}°C")
+    m3.metric("Rel. Humidity Index", f"{res['hum']:.1f}")
+    m4.metric("Risk Level", res['risk'])
+
+    st.write("### 📈 Annual Vulnerability Trend")
+    df = pd.DataFrame(res['trend'], index=month_names, columns=['Risk Score'])
+    st.line_chart(df, color="#1B4332")
 
     # 2. Raster Map (1km Zone)
     st.markdown("---")
     st.subheader("🎯 1km Radius Vulnerability Raster")
     
     m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=15)
-    
-    # Add Raster Layer
     map_id = res['vuln_img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['#2dc937', '#e7b416', '#cc3232']})
-    folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='Google Earth Engine', name="Vulnerability").add_to(m)
+    folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name="Vulnerability").add_to(m)
     
-    # Add Legend
+    # LEGEND WITH BLACK CONTRAST TEXT
     legend_html = '''
-     <div style="position: fixed; bottom: 50px; left: 50px; width: 150px; height: 110px; 
-     background-color: white; border:2px solid grey; z-index:9999; font-size:14px;
-     padding: 10px; border-radius: 5px;">
-     <b>Risk Level</b><br>
-     <i style="background:#cc3232;width:12px;height:12px;display:inline-block"></i> High<br>
-     <i style="background:#e7b416;width:12px;height:12px;display:inline-block"></i> Moderate<br>
-     <i style="background:#2dc937;width:12px;height:12px;display:inline-block"></i> Low
+     <div style="position: fixed; bottom: 50px; left: 50px; width: 150px; height: 115px; 
+     background-color: white; border:2px solid #1B4332; z-index:9999; font-size:14px;
+     padding: 12px; border-radius: 8px; box-shadow: 2px 2px 5px rgba(0,0,0,0.3);">
+     <b style="color: black;">Risk Level</b><br>
+     <i style="background:#cc3232;width:12px;height:12px;display:inline-block"></i> <span style="color: black;">High</span><br>
+     <i style="background:#e7b416;width:12px;height:12px;display:inline-block"></i> <span style="color: black;">Moderate</span><br>
+     <i style="background:#2dc937;width:12px;height:12px;display:inline-block"></i> <span style="color: black;">Low</span>
      </div>
      '''
     m.get_root().html.add_child(folium.Element(legend_html))
-    
-    folium.Marker([st.session_state.lat, st.session_state.lon], popup="Target Farm").add_to(m)
+    folium.Marker([st.session_state.lat, st.session_state.lon]).add_to(m)
     st_folium(m, width="100%", height=500)
 
-    # 3. Recommendations
+    # 3. Recommendations & Tips
     st.markdown("---")
-    st.subheader("📋 Manual Recommendations & Field Guide")
+    st.subheader("Recommendations")
     rec1, rec2 = st.columns(2)
     
     with rec1:
-        st.markdown(f"### 🛡️ Immediate Manual Recommendation ({res['risk']})")
+        st.markdown(f"### Immediate Recommendation ({res['risk']})")
         if res['risk'] == "HIGH":
             st.error("""
-            **ACTION REQUIRED:**
-            1. **Drainage Management:** Deepen lateral canals to 30-45cm. Ensure no stagnant water exists for more than 12 hours.
-            2. **Soil Sterilization:** If bacterial wilt is suspected, drench the 1km boundary soil with Copper Oxychloride.
-            3. **Isolation:** Prevent movement of farm tools from the High-Risk zone to other areas.
+            1. **Drainage:** Deepen lateral canals immediately to 45cm.
+            2. **Disease Control:** Apply Copper Oxychloride soil drench.
+            3. **Isolation:** Restrict tool sharing between farm blocks.
             """)
         elif res['risk'] == "MODERATE":
             st.warning("""
-            **PREVENTATIVE MEASURES:**
-            1. **Bio-Control:** Apply *Trichoderma* as a soil drench to prevent Rhizome Rot.
-            2. **Nutrient Boost:** Apply Potash-rich fertilizer to strengthen the plant's cell walls.
-            3. **Observation:** Check for "water-soaked" spots at the base of the pseudostem twice weekly.
+            1. **Bio-Control:** Apply *Trichoderma* drench to prevent Rhizome Rot.
+            2. **Nutrition:** Increase Potash application to strengthen rhizomes.
+            3. **Scouting:** Monitor stem bases twice a week for water-soaking.
             """)
         else:
             st.success("""
-            **MAINTENANCE MODE:**
-            1. **Mulching:** Apply rice straw or dried leaves to stabilize soil temperature.
-            2. **Organic Matter:** Mix vermicompost into the soil during hilling-up.
-            3. **Spacing:** Maintain 25cm distance for optimal airflow.
+            1. **Mulching:** Use 10cm rice straw to stabilize soil moisture.
+            2. **Organic Matter:** Mix vermicompost into soil during hilling-up.
+            3. **Maintenance:** Ensure optimal 25cm spacing for ventilation.
             """)
 
     with rec2:
-        st.markdown("### 🌿 Comprehensive Manual Guide")
-        with st.expander("🩺 Disease ID (Manual Check)"):
-            st.write("**Soft Rot:** Yellowing starts at leaf tips; rhizomes become mushy.")
-            st.write("**Bacterial Wilt:** Sudden wilting while leaves are still green; milky ooze in stem.")
-        with st.expander("🧪 Best Practices"):
-            st.write("- **Crop Rotation:** Do not plant after Solanaceous crops (Tomato/Pepper).")
-            st.write("- **Seed Treatment:** Treat rhizomes with Mancozeb before planting.")
+        st.markdown("### tip")
+        with st.expander("🩺 Disease ID"):
+            st.write("**Soft Rot:** Yellowing starts at leaf tips; mushy rhizomes.")
+            st.write("**Bacterial Wilt:** Sudden wilting while green; milky ooze in stem.")
+        with st.expander("🧪 Field Best Practices"):
+            st.write("- **Rotation:** Avoid planting after Tomatoes or Peppers.")
+            st.write("- **Treatment:** Soak rhizomes in fungicide before planting.")
+            st.write(f"- **Climate Note:** Avg LST for this area is {res['lst']:.1f}°C; keep soil shaded if temp exceeds 32°C.")
