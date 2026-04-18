@@ -12,12 +12,11 @@ from streamlit_js_eval import get_geolocation
 def get_base64_of_bin_file(bin_file):
     if os.path.exists(bin_file):
         with open(bin_file, 'rb') as f:
-            data = f.read()
-        return base64.b64encode(data).decode()
+            return base64.b64encode(f.read()).decode()
     return None
 
 # ----------------------------------------------------------
-# 🎨 UI & DESIGN
+# 🎨 UI
 # ----------------------------------------------------------
 st.set_page_config(layout="wide", page_title="Ginger Pest Warning System")
 
@@ -26,149 +25,139 @@ logo_tag = f'<img src="data:image/png;base64,{logo_base64}" width="70">' if logo
 
 st.markdown(f"""
 <style>
-    .main {{ background-color: #081c15; color: #D8F3DC; font-family: 'Inter', sans-serif; }}
-    .header-container {{
-        display: flex; align-items: center; background: rgba(27,67,50,0.8);
-        padding: 20px; border-radius: 20px; border: 1px solid rgba(255,255,255,0.1);
-        margin-bottom: 25px; backdrop-filter: blur(10px);
-    }}
-    .header-text {{ margin-left: 20px; }}
-    .header-text h1 {{ margin: 0; font-size: 26px; color: #ffffff; }}
-    .header-text p {{ margin: 0; font-size: 13px; color: #95d5b2; text-transform: uppercase; }}
+.main {{ background-color: #081c15; color: #D8F3DC; }}
+.header-container {{
+    display:flex; align-items:center;
+    background:rgba(27,67,50,0.8);
+    padding:20px; border-radius:20px;
+}}
+.header-text {{ margin-left:20px; }}
 </style>
+
 <div class="header-container">
-    {logo_tag}
-    <div class="header-text">
-        <h1>Ginger Pest Warning System</h1>
-        <p>Agusipan 4H CLUB MONITORING DASHBOARD</p>
-    </div>
+{logo_tag}
+<div class="header-text">
+<h2>Ginger Pest Warning System</h2>
+<p>Agusipan 4H CLUB MONITORING DASHBOARD</p>
+</div>
 </div>
 """, unsafe_allow_html=True)
 
 # ----------------------------------------------------------
-# 🛰️ EARTH ENGINE INITIALIZATION (Aggressive Project Setup)
+# 🌍 INIT EE
 # ----------------------------------------------------------
-def initialize_ee():
-    if "ee_initialized" not in st.session_state:
-        try:
-            if "gcp_service_account" in st.secrets:
-                creds_info = st.secrets["gcp_service_account"]
-                # Explicit Project ID
-                project_id = creds_info["project_id"]
-                
-                creds = ee.ServiceAccountCredentials(
-                    creds_info["client_email"],
-                    key_data=creds_info["private_key"]
-                )
-                
-                # Force the project environment
-                ee.Initialize(creds, project=project_id)
-                st.session_state.project_id = project_id
-                st.session_state.ee_initialized = True
-            else:
-                ee.Initialize()
-        except Exception as e:
-            st.error(f"🚨 Connection Error: {e}")
-            st.stop()
+def init_ee():
+    if "ee_init" not in st.session_state:
+        if "gcp_service_account" in st.secrets:
+            info = st.secrets["gcp_service_account"]
+            creds = ee.ServiceAccountCredentials(
+                info["client_email"],
+                key_data=info["private_key"]
+            )
+            ee.Initialize(creds, project=info["project_id"])
+        else:
+            ee.Initialize()
+        st.session_state.ee_init = True
 
-initialize_ee()
+init_ee()
 
 # ----------------------------------------------------------
-# ⚙️ SIDEBAR
+# 📍 SIDEBAR
 # ----------------------------------------------------------
 with st.sidebar:
-    st.header("📍 Farm Settings")
     loc = get_geolocation()
-    lat = st.number_input("Latitude", value=loc['coords']['latitude'] if loc else 10.7324, format="%.4f")
-    lon = st.number_input("Longitude", value=loc['coords']['longitude'] if loc else 122.5480, format="%.4f")
-    month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-    selected_month = st.selectbox("Month", range(1,13), format_func=lambda x: month_names[x-1])
-    run_btn = st.button("🚀 Run Analysis", use_container_width=True)
+    lat = st.number_input("Latitude", value=loc['coords']['latitude'] if loc else 10.73)
+    lon = st.number_input("Longitude", value=loc['coords']['longitude'] if loc else 122.54)
+
+    months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+    m = st.selectbox("Month", range(1,13), format_func=lambda x: months[x-1])
+
+    run = st.button("Run Analysis")
 
 # ----------------------------------------------------------
-# 📊 ANALYSIS LOGIC
+# 📊 CACHE SAFE DATA ONLY
 # ----------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def run_analysis(lat, lon):
+@st.cache_data
+def get_data(lat, lon):
     roi = ee.Geometry.Point([lon, lat])
     buffer = roi.buffer(1000)
-    
-    # Terrain
+
     dem = ee.Image('USGS/SRTMGL1_003').clip(buffer)
     slope = ee.Terrain.slope(dem)
 
     results = []
-    for m in range(1, 13):
-        start = ee.Date.fromYMD(2023, m, 1)
+
+    for i in range(1,13):
+        start = ee.Date.fromYMD(2023, i, 1)
         end = start.advance(1, 'month')
 
-        # Precipitation (CHIRPS)
-        rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start, end).sum().clip(buffer)
-        
-        # Risk Score (Simplified Weighting)
-        vuln = slope.divide(30).multiply(0.3).add(rain.divide(500).multiply(0.7)).clip(buffer)
-        
-        # Extract Values
-        score = vuln.reduceRegion(ee.Reducer.mean(), buffer, 100).getInfo().get('slope', 0.5)
-        rain_val = rain.reduceRegion(ee.Reducer.mean(), buffer, 100).getInfo().get('precipitation', 0)
+        rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start,end).sum()
 
-        results.append({"score": score, "rain": rain_val, "img": vuln})
+        vuln = slope.divide(30).multiply(0.3)\
+                .add(rain.divide(500).multiply(0.7))
+
+        score = vuln.reduceRegion(ee.Reducer.mean(), buffer, 100).getInfo()
+        rain_val = rain.reduceRegion(ee.Reducer.mean(), buffer,100).getInfo()
+
+        results.append({
+            "score": score.get('slope',0.5),
+            "rain": rain_val.get('precipitation',0)
+        })
+
     return results
 
 # ----------------------------------------------------------
-# 🖥️ DASHBOARD DISPLAY
+# 🧠 REBUILD IMAGE (NOT CACHED)
 # ----------------------------------------------------------
-if run_btn or "data" in st.session_state:
+def build_vuln_image(lat, lon, month):
+    roi = ee.Geometry.Point([lon, lat])
+    buffer = roi.buffer(1000)
+
+    dem = ee.Image('USGS/SRTMGL1_003').clip(buffer)
+    slope = ee.Terrain.slope(dem)
+
+    start = ee.Date.fromYMD(2023, month, 1)
+    end = start.advance(1, 'month')
+
+    rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start,end).sum()
+
+    vuln = slope.divide(30).multiply(0.3)\
+            .add(rain.divide(500).multiply(0.7))\
+            .clip(buffer)
+
+    return vuln
+
+# ----------------------------------------------------------
+# 🚀 RUN
+# ----------------------------------------------------------
+if run or "data" in st.session_state:
+
     if "data" not in st.session_state:
-        with st.spinner("Processing..."):
-            st.session_state.data = run_analysis(lat, lon)
+        st.session_state.data = get_data(lat, lon)
 
-    active = st.session_state.data[selected_month-1]
-    
-    # Metrics
-    m1, m2 = st.columns(2)
-    m1.metric("🌧️ Rainfall", f"{active['rain']:.1f} mm")
-    
-    risk = "HIGH" if active['score'] > 0.6 else "MODERATE" if active['score'] > 0.35 else "LOW"
-    risk_color = "#ff4b4b" if risk == "HIGH" else "#ffa500" if risk == "MODERATE" else "#00c853"
-    m2.markdown(f"**⚠️ Risk Level** <br> <h2 style='color:{risk_color}; margin:0;'>{risk}</h2>", unsafe_allow_html=True)
+    data = st.session_state.data[m-1]
 
-    st.subheader("🗺️ Vulnerability Raster Map (1km Radius)")
-    
-    # FOLIUM MAP
-    m = folium.Map(location=[lat, lon], zoom_start=15, tiles='CartoDB dark_matter')
-    
-    try:
-        # VISUALIZATION PARAMS
-        vis = {'min': 0, 'max': 0.8, 'palette': ['00FF00', 'FFFF00', 'FF0000']}
-        
-        # RASTER LAYER (The fixed call)
-        map_id_dict = ee.Image(active['img']).getMapId(vis)
-        
-        folium.TileLayer(
-            tiles=map_id_dict['tile_fetcher'].url_format,
-            attr='Google Earth Engine',
-            overlay=True,
-            name='Pest Vulnerability',
-            opacity=0.7
-        ).add_to(m)
+    st.metric("🌧 Rainfall", f"{data['rain']:.1f} mm")
 
-        # Legend
-        legend_html = '''
-        <div style="position: fixed; bottom: 50px; left: 50px; width: 130px; height: 90px; 
-        background: rgba(0,0,0,0.8); color: white; padding: 10px; border-radius: 5px; 
-        z-index:9999; font-size: 12px; border: 1px solid #555;">
-        <b>Risk Scale</b><br>
-        <i style="background:red; width:10px; height:10px; display:inline-block;"></i> High Risk<br>
-        <i style="background:yellow; width:10px; height:10px; display:inline-block;"></i> Moderate<br>
-        <i style="background:green; width:10px; height:10px; display:inline-block;"></i> Low Risk
-        </div>
-        '''
-        m.get_root().html.add_child(folium.Element(legend_html))
-        
-        st_folium(m, width=1200, height=500)
-        
-    except Exception as e:
-        st.error("The map could not be displayed.")
-        st.warning(f"Technical Reason: {e}")
-        st.info("💡 Ensure your Project ID in Secrets matches your Google Cloud Console exactly.")
+    score = data['score']
+    risk = "HIGH" if score>0.6 else "MODERATE" if score>0.35 else "LOW"
+    st.metric("⚠ Risk", risk)
+
+    # ------------------------------------------------------
+    # 🗺️ MAP
+    # ------------------------------------------------------
+    vuln_img = build_vuln_image(lat, lon, m)
+
+    mapp = folium.Map(location=[lat, lon], zoom_start=15)
+
+    vis = {'min':0,'max':0.8,'palette':['green','yellow','red']}
+
+    map_id = vuln_img.getMapId(vis)
+
+    folium.TileLayer(
+        tiles=map_id['tile_fetcher'].url_format,
+        attr='EE',
+        overlay=True
+    ).add_to(mapp)
+
+    st_folium(mapp, width=1200, height=500)
