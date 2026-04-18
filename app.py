@@ -35,8 +35,8 @@ st.markdown(f"""
 <div style="display:flex; align-items:center; gap:15px; background:#1B4332; padding:15px; border-radius:15px; margin-bottom:20px;">
 {logo_html}
 <div>
-<h2 style="margin:0; color:white;">Ginger Pest Warning System</h2>
-<p style="margin:0; color:#D8F3DC;">Agusipan 4H CLUB MONITORING DASHBOARD</p>
+<h2 style="margin:0; color:white;">Agusipan Ginger Warning System</h2>
+<p style="margin:0; color:#D8F3DC;">INTEGRATED PEST & RAINFALL MONITORING</p>
 </div>
 </div>
 """, unsafe_allow_html=True)
@@ -55,7 +55,7 @@ try:
         ee.Initialize()
     EE_AVAILABLE = True
 except Exception as e:
-    st.error(f"❌ Earth Engine Authentication Failed: {e}")
+    st.error(f"❌ Connection Error: {e}")
 
 # ============================================================
 # HELPER FUNCTIONS
@@ -66,9 +66,6 @@ def get_ip_location():
         d = r.json()
         return float(d["latitude"]), float(d["longitude"]), f"{d.get('city','')}, {d.get('region','')}"
     except: return None
-
-def safe_image(ee_img, name):
-    return ee.Image(ee_img).rename(name).unmask(0)
 
 def normalize_img(img, buffer):
     img = ee.Image(img).unmask(0)
@@ -81,143 +78,166 @@ def normalize_img(img, buffer):
 
 def build_analysis(lat, lon, month):
     roi = ee.Geometry.Point([lon, lat])
-    buffer = roi.buffer(1500) # Slightly larger buffer for context
+    buffer = roi.buffer(2000)
     year = 2023 
 
-    # 1. ANNUAL RAINFALL (CHIRPS)
+    # 1. ANNUAL RAINFALL
     rain_col = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(f'{year}-01-01', f'{year}-12-31')
     annual_rain = rain_col.sum().clip(buffer).rename('annual_rain')
 
-    # 2. VULNERABILITY COMPONENTS
+    # 2. VULNERABILITY
     dem = ee.Image('USGS/SRTMGL1_003').clip(buffer)
     slope = ee.Terrain.slope(dem).rename('slope')
-    twi = dem.focal_mean(3).add(1).log().divide(slope.add(1)).rename('twi')
-    
     start = ee.Date.fromYMD(year, month, 1)
     end = start.advance(1, 'month')
-    month_rain = safe_image(ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start, end).sum(), 'm_rain')
+    month_rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start, end).sum().unmask(0)
 
-    # Normalize for score
+    # Weights
     slope_n = normalize_img(slope, buffer)
-    twi_n = normalize_img(twi, buffer)
     rain_n = normalize_img(month_rain, buffer)
-
-    # Weights: Slope 30%, TWI 30%, Monthly Rain 40%
-    vuln = slope_n.multiply(0.3).add(twi_n.multiply(0.3)).add(rain_n.multiply(0.4)).rename('vuln').clip(buffer)
+    vuln = slope_n.multiply(0.4).add(rain_n.multiply(0.6)).rename('vuln').clip(buffer)
     
     return vuln, annual_rain, buffer
 
 # ============================================================
 # UI CONTROLS
 # ============================================================
-st.subheader("📍 Farm Location & Parameters")
-btn_col, info_col = st.columns([1, 3])
+st.subheader("📍 Location & Time Selection")
+c1, c2 = st.columns([1, 2])
 
-with btn_col:
-    if st.button("📡 Auto-Detect Location"):
+with c1:
+    if st.button("📡 Auto-Detect My Location"):
         res = get_ip_location()
         if res:
             st.session_state.lat, st.session_state.lon, st.session_state.loc_label = res
             st.rerun()
 
-with info_col:
-    st.info(f"📌 **{st.session_state.loc_label}** — Lat: `{st.session_state.lat:.4f}`, Lon: `{st.session_state.lon:.4f}`")
+with c2:
+    st.info(f"Current Target: **{st.session_state.loc_label}**")
 
-with st.expander("✏️ Manual Coordinates & Settings"):
-    c1, c2, c3 = st.columns(3)
-    mlat = c1.number_input("Latitude", value=st.session_state.lat, format="%.4f")
-    mlon = c2.number_input("Longitude", value=st.session_state.lon, format="%.4f")
+with st.expander("⚙️ Manual Adjustments"):
+    mc1, mc2, mc3 = st.columns(3)
+    mlat = mc1.number_input("Lat", value=st.session_state.lat, format="%.4f")
+    mlon = mc2.number_input("Lon", value=st.session_state.lon, format="%.4f")
     month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-    sel_month = c3.selectbox("Analysis Month", range(1, 13), index=4, format_func=lambda x: month_names[x-1])
-    
-    if st.button("✅ Update & Save Settings"):
+    sel_month = mc3.selectbox("Month", range(1, 13), index=4, format_func=lambda x: month_names[x-1])
+    if st.button("Apply Changes"):
         st.session_state.lat, st.session_state.lon = mlat, mlon
-        st.session_state.loc_label = "Custom Entry"
+        st.session_state.loc_label = "Manual Target"
         st.rerun()
 
-if st.button("🚀 Run Full Analysis", type="primary"):
-    if not EE_AVAILABLE:
-        st.error("Cannot run analysis: Earth Engine is not connected.")
-    else:
-        with st.spinner("⏳ Fetching Satellite Data..."):
-            try:
-                vuln_img, rain_img, buffer = build_analysis(st.session_state.lat, st.session_state.lon, sel_month)
-                
-                # Extract numeric stats
-                v_stats = vuln_img.reduceRegion(ee.Reducer.mean(), buffer, 100).getInfo()
-                r_stats = rain_img.reduceRegion(ee.Reducer.mean(), buffer.centroid(), 100).getInfo()
-                
-                score = float(v_stats.get('vuln') or 0.5)
-                rain_val = float(r_stats.get('annual_rain') or 0.0)
-                risk = "HIGH" if score > 0.6 else "MODERATE" if score > 0.35 else "LOW"
-                
-                st.session_state.results = {
-                    "score": score,
-                    "risk": risk,
-                    "avg_rain": rain_val,
-                    "month_name": month_names[sel_month-1],
-                    "vuln_img": vuln_img,
-                    "rain_img": rain_img
-                }
-            except Exception as e:
-                st.error(f"Analysis failed: {e}")
+if st.button("🚀 Run Analysis", type="primary"):
+    with st.spinner("⏳ Processing Satellite Imagery..."):
+        try:
+            v_img, r_img, buffer = build_analysis(st.session_state.lat, st.session_state.lon, sel_month)
+            v_stats = v_img.reduceRegion(ee.Reducer.mean(), buffer, 100).getInfo()
+            r_stats = r_img.reduceRegion(ee.Reducer.mean(), buffer.centroid(), 100).getInfo()
+            
+            score = float(v_stats.get('vuln') or 0.5)
+            rain_val = float(r_stats.get('annual_rain') or 0.0)
+            risk = "HIGH" if score > 0.6 else "MODERATE" if score > 0.35 else "LOW"
+            
+            st.session_state.results = {
+                "score": score, "risk": risk, "avg_rain": rain_val,
+                "month_name": month_names[sel_month-1], "v_img": v_img, "r_img": r_img
+            }
+        except Exception as e:
+            st.error(f"Analysis failed: {e}")
 
 # ============================================================
-# DISPLAY RESULTS
+# RESULTS DISPLAY
 # ============================================================
 if st.session_state.results:
     res = st.session_state.results
     
-    # 1. METRICS
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("📊 Vulnerability Score", f"{res['score']:.2f}")
+    m1.metric("📊 Risk Score", f"{res['score']:.2f}")
     m2.metric("⚠️ Risk Level", res['risk'])
-    m3.metric("📅 Targeted Month", res['month_name'])
-    m4.metric("🌧️ Avg Annual Rain", f"{res['avg_rain']:.0f} mm")
+    m3.metric("📅 Month", res['month_name'])
+    m4.metric("🌧️ Annual Rain", f"{res['avg_rain']:.0f} mm")
 
-    # 2. MAP
-    st.subheader("🗺️ Interactive Raster Layers")
-    try:
-        m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=14)
+    # MAP SECTION
+    st.subheader("🗺️ Risk Level Map")
+    m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=14)
+    
+    # Add Raster Layers
+    v_id = res['v_img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['2dc937', 'e7b416', 'cc3232']})
+    folium.TileLayer(tiles=v_id['tile_fetcher'].url_format, attr='GEE', name='Risk Level (Vulnerability)', overlay=True).add_to(m)
+
+    r_id = res['r_img'].getMapId({'min': 1500, 'max': 3500, 'palette': ['#f7fbff', '#084594']})
+    folium.TileLayer(tiles=r_id['tile_fetcher'].url_format, attr='GEE', name='Annual Rain Map', overlay=True, show=False).add_to(m)
+
+    folium.LayerControl().add_to(m)
+
+    # ADD CUSTOM LEGEND (HTML)
+    legend_html = '''
+     <div style="position: fixed; bottom: 50px; left: 50px; width: 190px; height: 180px; 
+     background-color: white; border:2px solid grey; z-index:9999; font-size:12px;
+     padding: 10px; border-radius: 5px;">
+     <b>Map Legend</b><br>
+     <div style="margin-top: 5px;"><b>Risk Vulnerability:</b></div>
+     <i style="background: #cc3232; width: 12px; height: 12px; float: left; margin-right: 5px; border:1px solid #999"></i> High Risk (Danger)<br>
+     <i style="background: #e7b416; width: 12px; height: 12px; float: left; margin-right: 5px; border:1px solid #999"></i> Moderate Risk<br>
+     <i style="background: #2dc937; width: 12px; height: 12px; float: left; margin-right: 5px; border:1px solid #999"></i> Low Risk (Safe)<br>
+     <hr style="margin: 5px 0;">
+     <div style="margin-top: 5px;"><b>Annual Rainfall:</b></div>
+     <i style="background: #084594; width: 12px; height: 12px; float: left; margin-right: 5px; border:1px solid #999"></i> Heavy Rain (>3000mm)<br>
+     <i style="background: #f7fbff; width: 12px; height: 12px; float: left; margin-right: 5px; border:1px solid #999"></i> Low Rain (<1500mm)
+     </div>
+     '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+    st_folium(m, width="100%", height=500, key="main_map")
+
+    # ============================================================
+    # EXPANDED MANUAL RECOMMENDATIONS
+    # ============================================================
+    st.markdown("---")
+    st.subheader("📋 Comprehensive Ginger Farming Manual")
+    
+    rec_col1, rec_col2 = st.columns(2)
+
+    with rec_col1:
+        st.markdown(f"### 🛡️ Targeted Mitigation for {res['risk']} Risk")
+        if res['risk'] == "HIGH":
+            st.error("""
+            **🚨 CRITICAL OUTBREAK ALERT:**
+            * **Immediate Drainage Construction:** Create "V-shaped" drainage canals every 2 meters. Stagnant water for even 24 hours can trigger irreversible Bacterial Wilt.
+            * **Sanitary Harvesting:** If signs of rot appear, use separate tools for healthy vs. infected areas to prevent cross-contamination.
+            * **Biological Protection:** Incorporate *Trichoderma* microbial inoculants into the soil to fight soil-borne pathogens.
+            * **Early Harvest:** If rhizomes are near maturity, consider early harvesting to save the crop from rot.
+            """)
+        elif res['risk'] == "MODERATE":
+            st.warning("""
+            **⚠️ ENHANCED MONITORING:**
+            * **Bi-Weekly Scouting:** Inspect the "collar" region (where the stem meets the soil) for water-soaked spots.
+            * **Soil Amendment:** Apply potash-rich fertilizer (0-0-60) to strengthen the cell walls of the rhizomes against infection.
+            * **Hill-Up Technique:** Increase the height of your plant rows to ensure rhizomes stay above the saturation line during heavy afternoon rains.
+            """)
+        else:
+            st.success("""
+            **✅ IDEAL CONDITIONS:**
+            * **Mulch Maintenance:** Maintain a 5cm thick layer of organic mulch (rice straw) to prevent soil splash-back, which carries fungal spores.
+            * **Organic Fertilization:** Apply well-decomposed chicken manure or vermicompost to build long-term plant resilience.
+            * **Water Management:** Monitor for dry spells; ensure soil stays damp but never muddy.
+            """)
+
+    with rec_col2:
+        st.markdown("### 🌿 Advanced Agricultural Practices")
+        with st.expander("🩺 Pest & Disease Identification"):
+            st.write("**Bacterial Wilt:** Look for sudden drooping of leaves while they are still green. A cut stem placed in water will show 'milky ooze'.")
+            st.write("**Soft Rot:** Rhizomes become mushy and emit a foul odor. Usually caused by poor drainage during the monsoon.")
+            st.write("**Shoot Borer:** Watch for holes in the stems and extrusion of frass (sawdust-like material).")
         
-        # Layer 1: Vulnerability
-        vis_v = {'min': 0, 'max': 0.8, 'palette': ['2dc937', 'e7b416', 'cc3232']}
-        v_id = res['vuln_img'].getMapId(vis_v)
-        folium.TileLayer(
-            tiles=v_id['tile_fetcher'].url_format,
-            attr='Google Earth Engine',
-            name='Pest Vulnerability',
-            overlay=True,
-            opacity=0.7
-        ).add_to(m)
+        with st.expander("🧪 Soil & Nutrient Optimization"):
+            st.write("**pH Balance:** Ginger prefers 5.5 to 6.5 pH. Use dolomite if your soil is too acidic (common in high-rain areas).")
+            st.write("**Rhizome Growth:** Ensure high Phosphorus (P) at planting and high Potassium (K) during the 4th to 6th months.")
+            st.write("**Organic Matter:** Target 3% organic matter in soil to improve aeration and drainage.")
 
-        # Layer 2: Rainfall
-        vis_r = {'min': 1500, 'max': 3500, 'palette': ['#f7fbff', '#9ecae1', '#084594']}
-        r_id = res['rain_img'].getMapId(vis_r)
-        folium.TileLayer(
-            tiles=r_id['tile_fetcher'].url_format,
-            attr='Google Earth Engine',
-            name='Annual Rainfall Intensity',
-            overlay=True,
-            show=False, # Off by default
-            opacity=0.6
-        ).add_to(m)
-
-        folium.LayerControl().add_to(m)
-        st_folium(m, width="100%", height=550, key="ginger_map")
-        
-    except Exception as e:
-        st.warning(f"Map Overlay Error: {e}. Check if layers exist for this area.")
-
-    # 3. RECOMMENDATIONS
-    st.subheader("📌 Action Plan")
-    if res['risk'] == "HIGH":
-        st.error(f"🚨 **High Alert for {res['month_name']}**: Environmental conditions strongly favor pest outbreaks. Implement strict drainage control and fungicide schedule.")
-    elif res['risk'] == "MODERATE":
-        st.warning(f"⚠️ **Moderate Caution**: Conditions are shifting. Increase field scouting to twice weekly.")
-    else:
-        st.success("✅ **Low Risk**: Conditions are currently stable for ginger cultivation.")
-
-    with st.expander("ℹ️ About Raster Layers"):
-        st.write("**Pest Vulnerability:** Derived from slope (drainage efficiency) and satellite-detected moisture.")
-        st.write("**Rainfall Intensity:** Uses CHIRPS Daily precipitation data aggregated over 12 months.")
+        with st.expander("🚜 Cultural Management & Rotation"):
+            st.write("**Intercropping:** Planting ginger under light shade (like coconut or banana) can reduce heat stress, but requires better air circulation.")
+            st.write("**Crop Rotation:** NEVER plant ginger after Solanaceous crops (Tomato, Eggplant, Potato) as they share the same wilt diseases.")
+            st.write("**Seed Treatment:** Soak 'seeds' (rhizomes) in a fungicide solution for 30 minutes before planting to ensure a clean start.")
+            
+        with st.expander("🌦️ Weather Resilience"):
+            st.write("**Extreme Rain:** In 'High Rain' blue zones, prioritize planting on steeper slopes where water runoff is naturally faster.")
+            st.write("**Drought:** Use drip irrigation if possible, as overhead sprinklers can spread fungal spores from the soil to the leaves.")
