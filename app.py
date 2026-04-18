@@ -1,45 +1,32 @@
 import streamlit as st
 import ee
 import folium
-import base64
-import os
 import pandas as pd
 import plotly.express as px
 from streamlit_folium import st_folium
 from streamlit_js_eval import get_geolocation
+import os
 
 # ============================================================
 # PAGE CONFIG
 # ============================================================
-st.set_page_config(layout="wide", page_title="Agusipan Ginger Warning System")
+st.set_page_config(layout="wide", page_title="Ginger Pest Warning")
 
-# Initialize Session States
+# Session State
 if "lat" not in st.session_state: st.session_state.lat = 10.9300
 if "lon" not in st.session_state: st.session_state.lon = 122.5200
-if "results" not in st.session_state: st.session_state.results = None 
+if "results" not in st.session_state: st.session_state.results = None
 
-# ============================================================
-# STYLING & HEADER
-# ============================================================
-st.markdown("""
-    <style>
-    .main { background-color: #f8f9fa; }
-    .stMetric { background-color: white; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    </style>
-    """, unsafe_allow_html=True)
-
+# Header
 st.markdown(f"""
-<div style="display:flex; align-items:center; gap:15px; background:#1B4332; padding:20px; border-radius:15px; margin-bottom:25px; color:white;">
-    <div style="font-size:40px;">🌱</div>
-    <div>
-        <h1 style="margin:0; font-size:28px;">Agusipan Ginger Warning System</h1>
-        <p style="margin:0; opacity:0.8;">Integrated Pest Risk & Rainfall Intelligence</p>
-    </div>
+<div style="background:#1B4332; padding:20px; border-radius:15px; color:white; margin-bottom:20px;">
+    <h1 style="margin:0;">🌱 Agusipan Ginger Warning System</h1>
+    <p style="margin:0; opacity:0.8;">Precision Monitoring: 1km Farm Analysis Zone</p>
 </div>
 """, unsafe_allow_html=True)
 
 # ============================================================
-# EARTH ENGINE INIT
+# EARTH ENGINE & LOCATION
 # ============================================================
 try:
     if "gcp_service_account" in st.secrets:
@@ -50,162 +37,110 @@ try:
     else:
         ee.Initialize()
 except Exception as e:
-    st.error(f"Cloud Connection Failed: {e}")
+    st.error(f"Earth Engine Error: {e}")
+
+# Auto-Detect Location
+loc = get_geolocation()
+if loc:
+    st.session_state.lat = loc['coords']['latitude']
+    st.session_state.lon = loc['coords']['longitude']
+
+col_a, col_b = st.columns([2,1])
+with col_a:
+    st.info(f"📍 **Monitoring Farm at:** Lat {st.session_state.lat:.4f}, Lon {st.session_state.lon:.4f}")
+with col_b:
+    with st.expander("Change Location Manually"):
+        st.session_state.lat = st.number_input("Lat", value=st.session_state.lat, format="%.4f")
+        st.session_state.lon = st.number_input("Lon", value=st.session_state.lon, format="%.4f")
 
 # ============================================================
-# LOCATION ENGINE
+# ANALYSIS (1KM RADIUS)
 # ============================================================
-col_loc_left, col_loc_right = st.columns([2, 1])
-
-with col_loc_left:
-    st.subheader("📍 Farm Location")
-    # Automatic GPS Detection
-    loc = get_geolocation()
-    if loc:
-        st.session_state.lat, st.session_state.lon = loc['coords']['latitude'], loc['coords']['longitude']
-    
-    st.info(f"**Target Area:** Lat {st.session_state.lat:.4f}, Lon {st.session_state.lon:.4f}")
-
-with col_loc_right:
-    with st.expander("🛠️ Change Coordinates"):
-        new_lat = st.number_input("Latitude", value=st.session_state.lat, format="%.4f")
-        new_lon = st.number_input("Longitude", value=st.session_state.lon, format="%.4f")
-        if st.button("Apply New Location"):
-            st.session_state.lat, st.session_state.lon = new_lat, new_lon
-            st.rerun()
-
-# ============================================================
-# ANALYSIS CALCULATIONS
-# ============================================================
-def run_gee_analysis(lat, lon, month):
+def perform_analysis(lat, lon):
     roi = ee.Geometry.Point([lon, lat])
-    buffer = roi.buffer(1000) # 1km Radius Zone
+    zone_1km = roi.buffer(1000)
     
-    # Data Sources
-    rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate('2023-01-01', '2023-12-31').sum()
-    dem = ee.Image('USGS/SRTMGL1_003').clip(buffer)
-    slope = ee.Terrain.slope(dem)
+    # Terrain & Rainfall Data
+    slope = ee.Terrain.slope(ee.Image('USGS/SRTMGL1_003')).clip(zone_1km)
+    rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate('2023-01-01', '2023-12-31').sum().clip(zone_1km)
     
-    # Normalization (0 to 1)
-    s_stats = slope.reduceRegion(ee.Reducer.minMax(), buffer, 30).getInfo()
-    slope_norm = slope.divide(ee.Number(s_stats.get('slope_max')).max(1))
+    # Risk Logic (Slope + Rain Weighting)
+    risk_img = slope.divide(45).multiply(0.4).add(rain.divide(3500).multiply(0.6)).rename('risk')
     
-    # Calculate Final Score
-    vuln = slope_norm.multiply(0.5).add(0.3).rename('score').clip(buffer)
+    # Data for Stats
+    s_val = slope.reduceRegion(ee.Reducer.mean(), zone_1km, 30).getInfo().get('slope')
+    r_val = rain.reduceRegion(ee.Reducer.mean(), zone_1km, 30).getInfo().get('precipitation')
+    score = risk_img.reduceRegion(ee.Reducer.mean(), zone_1km, 30).getInfo().get('risk')
     
-    # Extract Values for Graph
-    avg_slope = slope.reduceRegion(ee.Reducer.mean(), buffer, 30).getInfo().get('slope')
-    total_rain = rain.reduceRegion(ee.Reducer.mean(), buffer, 30).getInfo().get('precipitation')
-    
-    return vuln, buffer, avg_slope, total_rain
+    return risk_img, s_val, r_val, score
+
+if st.button("🚀 Analyze 1km Zone", use_container_width=True, type="primary"):
+    with st.spinner("Calculating risk factors..."):
+        r_img, s_v, r_v, sc = perform_analysis(st.session_state.lat, st.session_state.lon)
+        st.session_state.results = {"score": sc, "slope": s_v, "rain": r_v, "img": r_img}
 
 # ============================================================
-# MAIN INTERFACE
-# ============================================================
-month_list = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-target_month = st.selectbox("📅 Select Month for Pest Analysis", range(1, 13), index=5, format_func=lambda x: month_list[x-1])
-
-if st.button("🚀 Start Farm Analysis", type="primary", use_container_width=True):
-    with st.spinner("Analyzing satellite layers..."):
-        v_img, v_buf, s_val, r_val = run_gee_analysis(st.session_state.lat, st.session_state.lon, target_month)
-        
-        score_val = v_img.reduceRegion(ee.Reducer.mean(), v_buf, 30).getInfo().get('score')
-        risk_lvl = "HIGH" if score_val > 0.6 else "MEDIUM" if score_val > 0.35 else "LOW"
-        
-        st.session_state.results = {
-            "score": score_val, "risk": risk_lvl, "slope": s_val, "rain": r_val,
-            "v_img": v_img, "month": month_list[target_month-1]
-        }
-
-# ============================================================
-# DASHBOARD DISPLAY
+# RESULTS DASHBOARD
 # ============================================================
 if st.session_state.results:
     res = st.session_state.results
+    risk_cat = "HIGH" if res['score'] > 0.6 else "MEDIUM" if res['score'] > 0.35 else "LOW"
     
-    # ROW 1: METRICS
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Risk Score", f"{res['score']:.2f}")
-    m2.metric("Risk Level", res['risk'])
-    m3.metric("Avg Slope", f"{res['slope']:.1f}°")
-    m4.metric("Annual Rain", f"{res['rain']:.0f}mm")
+    # Metrics
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Pest Risk Level", risk_cat)
+    m2.metric("Avg Slope", f"{res['slope']:.1f}°")
+    m3.metric("Annual Rain", f"{res['rain']:.0f} mm")
 
     st.markdown("---")
 
-    # ROW 2: DUAL MAPS & GRAPH
-    col_map1, col_map2, col_graph = st.columns([1, 1, 1])
-    
-    with col_map1:
-        st.write("🌍 **Location Locator**")
-        m_loc = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=15)
-        folium.Marker([st.session_state.lat, st.session_state.lon], tooltip="Your Farm").add_to(m_loc)
-        st_folium(m_loc, height=300, width=None, key="loc_map")
+    # Dual Maps & Graph
+    map_col1, map_col2, graph_col = st.columns([1, 1, 1])
 
-    with col_map2:
+    with map_col1:
+        st.write("🗺️ **Locator Map**")
+        m1 = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=15)
+        folium.Marker([st.session_state.lat, st.session_state.lon]).add_to(m1)
+        st_folium(m1, height=300, width=None, key="locator")
+
+    with map_col2:
         st.write("🎯 **1km Risk Zone**")
-        m_risk = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=14)
-        # Add GEE Layer
-        map_id = res['v_img'].getMapId({'min': 0, 'max': 1, 'palette': ['green', 'yellow', 'red']})
-        folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', overlay=True, name="Risk Raster").add_to(m_risk)
-        
-        # Legend
-        legend_html = f'''
-             <div style="position: fixed; bottom: 20px; left: 20px; width: 120px; background: white; 
-             padding: 10px; border: 2px solid #1B4332; z-index:999; font-size:12px; border-radius:5px;">
-             <b>Risk Legend</b><br>
-             <i style="background: red; width:10px; height:10px; float:left; margin-right:5px;"></i> High<br>
-             <i style="background: yellow; width:10px; height:10px; float:left; margin-right:5px;"></i> Mid<br>
-             <i style="background: green; width:10px; height:10px; float:left; margin-right:5px;"></i> Safe
-             </div>'''
-        m_risk.get_root().html.add_child(folium.Element(legend_html))
-        st_folium(m_risk, height=300, width=None, key="risk_map")
+        m2 = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=14)
+        v_id = res['img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['#2dc937', '#e7b416', '#cc3232']})
+        folium.TileLayer(tiles=v_id['tile_fetcher'].url_format, attr='GEE', name="Risk Zone").add_to(m2)
+        st_folium(m2, height=300, width=None, key="risk_zone")
 
-    with col_graph:
-        st.write("📊 **Analysis Breakdown**")
-        chart_data = pd.DataFrame({
-            "Factor": ["Slope Strength", "Rainfall Intensity", "Final Score"],
-            "Value": [res['slope']/45, res['rain']/4000, res['score']] # Normalized for visual
+    with graph_col:
+        st.write("📊 **Risk Breakdown**")
+        df = pd.DataFrame({
+            "Source": ["Slope", "Rainfall", "Total Risk"],
+            "Intensity": [res['slope']/45, res['rain']/3500, res['score']]
         })
-        fig = px.bar(chart_data, x="Factor", y="Value", color="Factor", range_y=[0,1],
-                     color_discrete_map={"Slope Strength":"#2A9D8F", "Rainfall Intensity":"#264653", "Final Score":"#E76F51"})
-        fig.update_layout(showlegend=False, height=300, margin=dict(t=10, b=10, l=10, r=10))
+        fig = px.bar(df, x="Source", y="Intensity", color="Source", range_y=[0,1],
+                     color_discrete_map={"Slope":"#2A9D8F", "Rainfall":"#264653", "Total Risk":"#E76F51"})
         st.plotly_chart(fig, use_container_width=True)
 
-    # ============================================================
-    # SIMPLE RECOMMENDATIONS
-    # ============================================================
+    # Simplified Recommendations
     st.markdown("### 📋 Farm Action Plan")
+    rec_box = st.container()
     
-    rec_col_left, rec_col_right = st.columns(2)
-    
-    with rec_col_left:
-        st.info(f"**Analysis for {res['month']}**")
-        if res['risk'] == "HIGH":
-            st.error(f"### 🚨 High Risk Action Needed")
-            st.markdown("""
-            * **Immediate Drainage:** Clean all outlet canals to prevent root rot.
-            * **Pest Check:** Scout twice a week for Bacterial Wilt (yellowing stems).
-            * **Treatment:** Apply organic fungicide (*Trichoderma*) immediately.
-            """)
-        elif res['risk'] == "MEDIUM":
-            st.warning(f"### ⚠️ Moderate Caution")
-            st.markdown("""
-            * **Soil Hilling:** Add soil to the base of ginger to keep rhizomes dry.
-            * **Weeding:** Keep rows clean to improve airflow.
-            * **Monitor:** Check plants after heavy rain.
-            """)
-        else:
-            st.success(f"### ✅ Low Risk (Safe)")
-            st.markdown("""
-            * **Maintain Mulch:** Add rice straw to keep soil temperature steady.
-            * **Fertilize:** Apply organic compost to boost plant immunity.
-            """)
-
-    with rec_col_right:
-        st.markdown("**General Ginger Guide**")
-        with st.expander("🌱 Planting Tips"):
-            st.write("Ensure rhizomes are treated with fungicide before planting. Use 25-30cm spacing.")
-        with st.expander("🩺 Disease Signs"):
-            st.write("Look for 'milky ooze' in cut stems. This is a sign of fatal Bacterial Wilt.")
-        with st.expander("🌦️ Weather Prep"):
-            st.write("In high-slope areas, use contour planting to prevent soil erosion.")
+    if risk_cat == "HIGH":
+        st.error("🚨 **High Alert:** Immediate action required for crop safety.")
+        st.markdown("""
+        * **Manual Task:** Dig deep 'V' canals around rows to shed water.
+        * **Treatment:** Apply organic fungicide/biocontrol to roots.
+        * **Monitoring:** Check for wilting leaves every morning.
+        """)
+    elif risk_cat == "MEDIUM":
+        st.warning("⚠️ **Warning:** Weather conditions are risky.")
+        st.markdown("""
+        * **Manual Task:** Apply mulch to stabilize soil moisture.
+        * **Treatment:** Ensure proper organic fertilization to build plant strength.
+        * **Monitoring:** Inspect the base of stems twice a week.
+        """)
+    else:
+        st.success("✅ **Safe:** Maintain current farming practices.")
+        st.markdown("""
+        * **Manual Task:** Keep rows clean of weeds for better airflow.
+        * **Monitoring:** Regular weekly scouting for general pests.
+        """)
