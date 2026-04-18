@@ -53,42 +53,42 @@ except Exception as e:
     st.error(f"❌ Connection Error: {e}")
 
 # ============================================================
-# OPTIMIZED ANALYSIS FUNCTIONS (500m Scale)
+# HIGH-PRECISION ANALYSIS FUNCTIONS
 # ============================================================
 
 @st.cache_data(ttl=3600)
-def analyze_500m_zone(lat, lon, sel_month):
+def analyze_high_precision(lat, lon, sel_month):
     roi = ee.Geometry.Point([lon, lat])
-    # UPDATED: 500m Buffer
     zone_500m = roi.buffer(500)
     
-    # 1. Terrain Analysis
+    # 1. High-Precision Terrain (Scale set to 10m for maximum detail)
     dem = ee.Image('USGS/SRTMGL1_003').clip(zone_500m)
     slope = ee.Terrain.slope(dem)
-    slope_val = slope.reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('slope').getInfo() or 0
+    # Using scale 10 to capture micro-topography shifts
+    slope_val = slope.reduceRegion(ee.Reducer.mean(), zone_500m, 10).get('slope').getInfo() or 0
     
     # 2. Historical Climate (2000-2026)
-    # Using Pentad for speed, Monthly Climatology logic
     rain_col = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD").filterDate('2000-01-01', '2026-12-31')
     
     trend = []
-    # Pre-calculate climate for metrics
-    sel_rain = rain_col.filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).mean()
-    sel_rain_val = sel_rain.reduceRegion(ee.Reducer.mean(), zone_500m, 100).get('precipitation').getInfo() or 0
+    # Fetch monthly climatology with bicubic resampling for smoother precision
+    sel_rain = rain_col.filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).mean().resample('bicubic')
+    sel_rain_val = sel_rain.reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('precipitation').getInfo() or 0
 
     for m in range(1, 13):
         m_rain = rain_col.filter(ee.Filter.calendarRange(m, m, 'month')).mean()
-        m_rain_val = m_rain.reduceRegion(ee.Reducer.mean(), zone_500m, 100).get('precipitation').getInfo() or 0
-        v_score = (slope_val / 45 * 0.4) + (m_rain_val / 10 * 0.6)
+        m_rain_val = m_rain.reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('precipitation').getInfo() or 0
+        # Refined Vulnerability Formula
+        v_score = (slope_val / 45 * 0.45) + (m_rain_val / 10 * 0.55)
         trend.append(min(v_score, 1.0))
 
-    # 3. 500m Raster for Map
+    # 3. Precision Raster (10m scale rendering)
     rain_map = rain_col.filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).mean().clip(zone_500m)
-    vuln_raster = slope.divide(45).multiply(0.4).add(rain_map.divide(10).multiply(0.6)).rename('vulnerability')
+    vuln_raster = slope.divide(45).multiply(0.45).add(rain_map.divide(10).multiply(0.55)).rename('vulnerability')
     
-    # 4. Long-term LST 
+    # 4. Long-term LST (1km resolution resampled to 500m zone)
     lst_col = ee.ImageCollection("MODIS/061/MOD11A1").filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).select('LST_Day_1km')
-    lst_val = lst_col.mean().multiply(0.02).subtract(273.15).reduceRegion(ee.Reducer.mean(), roi, 500).get('LST_Day_1km').getInfo() or 0
+    lst_val = lst_col.mean().multiply(0.02).subtract(273.15).reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('LST_Day_1km').getInfo() or 0
     
     return {
         "score": trend[sel_month-1],
@@ -112,8 +112,9 @@ with st.sidebar:
             st.rerun()
 
     with st.expander("⌨️ Manual Coordinate Entry"):
-        mlat = st.number_input("Latitude", value=st.session_state.lat, format="%.6f")
-        mlon = st.number_input("Longitude", value=st.session_state.lon, format="%.6f")
+        # Increased decimal step for high precision entry
+        mlat = st.number_input("Latitude", value=st.session_state.lat, format="%.8f", step=0.000001)
+        mlon = st.number_input("Longitude", value=st.session_state.lon, format="%.8f", step=0.000001)
         if st.button("Apply Coordinates"):
             st.session_state.lat, st.session_state.lon = mlat, mlon
             st.rerun()
@@ -127,9 +128,9 @@ with st.sidebar:
 # EXECUTION
 # ============================================================
 if test_btn:
-    with st.spinner("Analyzing 500m farm zone patterns..."):
+    with st.spinner("Executing high-precision spatial analysis..."):
         try:
-            results = analyze_500m_zone(st.session_state.lat, st.session_state.lon, sel_month)
+            results = analyze_high_precision(st.session_state.lat, st.session_state.lon, sel_month)
             results["month"] = month_names[sel_month-1]
             st.session_state.results = results
         except Exception as e:
@@ -142,25 +143,25 @@ if st.session_state.results:
     res = st.session_state.results
     
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Local Vulnerability", f"{res['score']:.2f}")
+    # Showing 3 decimal places for index precision
+    m1.metric("Local Vulnerability", f"{res['score']:.3f}")
     m2.metric("Long-term LST", f"{res['lst']:.1f}°C")
-    m3.metric("Humidity Index", f"{res['hum']:.1f}")
+    m3.metric("Humidity Index", f"{res['hum']:.2f}")
     m4.metric("Risk Level", res['risk'])
 
-    st.write(f"### 📈 Annual Pattern (2000-2026 Avg)")
+    st.write(f"### 📈 Precision Annual Pattern (2000-2026 Avg)")
     df = pd.DataFrame(res['trend'], index=month_names, columns=['Risk Score'])
     st.line_chart(df, color="#1B4332")
 
     st.markdown("---")
-    st.subheader("🎯 500m Radius Vulnerability Raster")
-    m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=16) # Zoomed in for 500m
+    st.subheader("🎯 High-Resolution Vulnerability Raster (500m)")
+    m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=17) 
     
-    # Display Raster
-    map_id = res['vuln_img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['#2dc937', '#e7b416', '#cc3232']})
-    folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name="500m Vulnerability").add_to(m)
+    # Raster display with high-precision palette
+    map_id = res['vuln_img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['#2dc937', '#92d050', '#e7b416', '#cc3232']})
+    folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name="Precision Risk").add_to(m)
     
-    # Display 500m Circle Boundary
-    folium.GeoJson(res['zone'].getInfo(), style_function=lambda x: {'color': '#1B4332', 'fillOpacity': 0.1, 'weight': 2}).add_to(m)
+    folium.GeoJson(res['zone'].getInfo(), style_function=lambda x: {'color': '#1B4332', 'fillOpacity': 0.05, 'weight': 1}).add_to(m)
 
     legend_html = '''
      <div style="position: fixed; bottom: 50px; left: 50px; width: 140px; height: 110px; 
@@ -196,4 +197,4 @@ if st.session_state.results:
         with st.expander("🧪 Field Best Practices"):
             st.write("- Never plant ginger after Tomato or Peppers.")
             st.write("- Treat rhizomes with fungicide before planting.")
-            st.write(f"- 500m Avg LST: {res['lst']:.1f}°C.")
+            st.write(f"- 500m High-Precision LST: {res['lst']:.2f}°C.")
