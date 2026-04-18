@@ -15,6 +15,7 @@ st.set_page_config(layout="wide", page_title="Pest Warning System")
 # ============================================================
 # SESSION STATE INITIALIZATION
 # ============================================================
+# Default coordinates (Iloilo area)
 if "lat" not in st.session_state: st.session_state.lat = 10.9300
 if "lon" not in st.session_state: st.session_state.lon = 122.5200
 if "results" not in st.session_state: st.session_state.results = None 
@@ -98,27 +99,38 @@ def analyze_high_precision(lat, lon, sel_month):
     }
 
 # ============================================================
-# SIDEBAR / INPUTS
+# SIDEBAR / INPUTS (UPDATED LOCATION CONTROLS)
 # ============================================================
 with st.sidebar:
-    st.header("📍 Location Control")
-    if st.button("🛰️ Use Device GPS", use_container_width=True):
-        loc = get_geolocation()
-        if loc:
-            st.session_state.lat, st.session_state.lon = loc['coords']['latitude'], loc['coords']['longitude']
-            st.rerun()
+    st.header("📍 Location Setup")
+    
+    # Option 1: Automatic GPS
+    st.write("### 🛰️ Auto-Location")
+    loc = get_geolocation()
+    if loc:
+        st.session_state.lat = loc['coords']['latitude']
+        st.session_state.lon = loc['coords']['longitude']
+        st.success(f"Location Captured: {st.session_state.lat:.4f}, {st.session_state.lon:.4f}")
+    else:
+        st.info("Waiting for GPS permission...")
 
+    st.markdown("---")
+    
+    # Option 2: Manual Entry
     with st.expander("⌨️ Manual Coordinate Entry"):
-        mlat = st.number_input("Latitude", value=st.session_state.lat, format="%.8f", step=0.000001)
-        mlon = st.number_input("Longitude", value=st.session_state.lon, format="%.8f", step=0.000001)
-        if st.button("Apply Coordinates"):
-            st.session_state.lat, st.session_state.lon = mlat, mlon
-            st.rerun()
+        mlat = st.number_input("Latitude", value=st.session_state.lat, format="%.8f")
+        mlon = st.number_input("Longitude", value=st.session_state.lon, format="%.8f")
+        if st.button("Set Manual Coordinates", use_container_width=True):
+            st.session_state.lat = mlat
+            st.session_state.lon = mlon
+            st.toast("Coordinates updated manually!")
+
+    st.markdown("---")
 
     month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
     sel_month = st.selectbox("📅 Analysis Month", range(1, 13), index=4, format_func=lambda x: month_names[x-1])
     
-    test_btn = st.button("🔍 TEST VULNERABILITY", type="primary", use_container_width=True)
+    test_btn = st.button("🔍 ANALYZE RISK", type="primary", use_container_width=True)
 
 # ============================================================
 # EXECUTION
@@ -138,6 +150,9 @@ if test_btn:
 if st.session_state.results:
     res = st.session_state.results
     
+    # Display coordinates used for current results
+    st.info(f"Analysis for: **Lat: {st.session_state.lat:.6f}, Lon: {st.session_state.lon:.6f}**")
+
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Local Vulnerability", f"{res['score']:.3f}")
     m2.metric("Long-term LST", f"{res['lst']:.1f}°C")
@@ -149,7 +164,6 @@ if st.session_state.results:
     st.line_chart(df, color="#1B4332")
 
     st.markdown("---")
-    # UPDATED HEADING: RISK MAP
     st.subheader("🎯 RISK MAP (500m)")
     m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=17) 
     
