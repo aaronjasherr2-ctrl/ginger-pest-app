@@ -1,27 +1,22 @@
 import streamlit as st
 import ee
 import folium
-import base64
-import os
 import pandas as pd
 from streamlit_folium import st_folium
 from streamlit_js_eval import get_geolocation
+import base64
+import os
 
 # ============================================================
 # PAGE CONFIG
 # ============================================================
-st.set_page_config(layout="wide", page_title="Ginger Pest Warning System")
+st.set_page_config(layout="wide", page_title="Pest Warning System")
 
 # ============================================================
-# SESSION STATE INITIALIZATION
+# SESSION STATE & EE INIT
 # ============================================================
-if "lat" not in st.session_state: st.session_state.lat = 10.9300
-if "lon" not in st.session_state: st.session_state.lon = 122.5200
-if "results" not in st.session_state: st.session_state.results = None 
+if "results" not in st.session_state: st.session_state.results = None
 
-# ============================================================
-# EARTH ENGINE INIT
-# ============================================================
 try:
     if "gcp_service_account" in st.secrets:
         info = dict(st.secrets["gcp_service_account"])
@@ -31,134 +26,130 @@ try:
     else:
         ee.Initialize()
 except Exception as e:
-    st.error(f"❌ Connection Error: {e}")
+    st.error(f"Connection Error: {e}")
 
 # ============================================================
-# ANALYSIS ENGINE
+# HEADER WITH LOGO
 # ============================================================
-def normalize_img(img, region):
-    img = ee.Image(img).unmask(0)
-    band = img.bandNames().get(0)
-    stats = img.reduceRegion(reducer=ee.Reducer.minMax(), geometry=region, scale=100)
-    mn = ee.Number(stats.get(ee.String(band).cat('_min')))
-    mx = ee.Number(stats.get(ee.String(band).cat('_max')))
-    return img.subtract(mn).divide(mx.subtract(mn).max(0.0001))
+def get_base64(path):
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    return None
 
-def get_rainfall_series(roi):
-    # Fetching 2023 monthly rainfall data for the graph
-    rain_col = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate('2023-01-01', '2023-12-31')
+logo_b64 = get_base64("agusipan_logo.png")
+
+# Custom CSS for the Header
+st.markdown(f"""
+    <div style="display: flex; align-items: center; background-color: #1B4332; padding: 20px; border-radius: 15px; margin-bottom: 25px;">
+        <div style="flex: 0 0 100px;">
+            <img src="data:image/png;base64,{logo_b64 if logo_b64 else ''}" style="width: 80px; height: 80px; object-fit: contain;">
+        </div>
+        <div style="flex: 1; margin-left: 20px;">
+            <h1 style="color: white; margin: 0; padding: 0; font-family: sans-serif;">Pest Warning System</h1>
+            <h4 style="color: #D8F3DC; margin: 0; padding: 0; font-weight: 300;">Monitoring system designed by AGUSIPAN 4H CLUB</h4>
+        </div>
+    </div>
+""", unsafe_allow_html=True)
+
+# ============================================================
+# ANALYSIS LOGIC
+# ============================================================
+def get_vulnerability_trend(roi):
+    """Calculates historical vulnerability (Slope + Monthly Rain) for the full year"""
     months = range(1, 13)
-    monthly_data = []
+    scores = []
+    
+    # Static Parameter: Slope
+    dem = ee.Image('USGS/SRTMGL1_003')
+    slope = ee.Terrain.slope(dem).clip(roi.buffer(1000))
+    slope_val = slope.reduceRegion(ee.Reducer.mean(), roi, 30).getInfo().get('slope', 0)
+    
+    # Dynamic Parameter: Historical Rainfall
+    rain_col = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate('2023-01-01', '2023-12-31')
+    
     for m in months:
-        m_sum = rain_col.filter(ee.Filter.calendarRange(m, m, 'month')).sum()
-        stats = m_sum.reduceRegion(ee.Reducer.mean(), roi, 100).getInfo()
-        monthly_data.append(stats.get('precipitation', 0))
-    return monthly_data
+        m_rain = rain_col.filter(ee.Filter.calendarRange(m, m, 'month')).sum()
+        rain_val = m_rain.reduceRegion(ee.Reducer.mean(), roi, 100).getInfo().get('precipitation', 0)
+        
+        # Simplified Vulnerability Logic: (Slope * 0.4) + (Normalized Rain * 0.6)
+        # Assuming 500mm is a 'max' rainfall month for normalization
+        v_score = (slope_val * 0.02) + ((rain_val / 500) * 0.6)
+        scores.append(min(v_score, 1.0))
+        
+    return scores
 
 # ============================================================
-# MAIN UI
+# INPUTS & EXECUTION
 # ============================================================
-st.title("🌱 Agusipan Ginger Warning System")
-
-col_a, col_b = st.columns([1, 2])
-with col_a:
-    st.subheader("📍 Location Settings")
+col_input, col_spacer = st.columns([1, 2])
+with col_input:
+    st.subheader("📍 Farm Location")
     loc = get_geolocation()
-    if loc:
-        st.session_state.lat = loc['coords']['latitude']
-        st.session_state.lon = loc['coords']['longitude']
+    lat = loc['coords']['latitude'] if loc else 10.9300
+    lon = loc['coords']['longitude'] if loc else 122.5200
+    st.caption(f"Coordinates: {lat:.4f}, {lon:.4f}")
     
-    st.write(f"**Lat:** {st.session_state.lat:.4f} | **Lon:** {st.session_state.lon:.4f}")
-    month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-    sel_month = st.selectbox("📅 Analysis Month", range(1, 13), index=4, format_func=lambda x: month_names[x-1])
-    
-    run_btn = st.button("🚀 Run Risk Analysis", type="primary", use_container_width=True)
+    run_btn = st.button("Analyze Parameters", type="primary", use_container_width=True)
 
 if run_btn:
-    with st.spinner("⏳ Crunching Satellite Data..."):
-        roi = ee.Geometry.Point([st.session_state.lon, st.session_state.lat])
-        zone_1km = roi.buffer(1000)
-        zone_5km = roi.buffer(5000)
-        
-        # Rainfall & Terrain
-        rain_img = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate('2023-01-01', '2023-12-31').sum().clip(zone_5km)
-        slope = ee.Terrain.slope(ee.Image('USGS/SRTMGL1_003')).clip(zone_5km)
-        
-        # Monthly Calc
-        m_start = ee.Date.fromYMD(2023, sel_month, 1)
-        m_rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(m_start, m_start.advance(1, 'month')).sum()
-        
-        # Scoring
-        vuln = normalize_img(slope, zone_5km).multiply(0.4).add(normalize_img(m_rain, zone_5km).multiply(0.6))
-        score = vuln.reduceRegion(ee.Reducer.mean(), zone_1km, 100).getInfo().get('slope', 0.5)
-        
-        risk_level = "HIGH" if score > 0.6 else "MODERATE" if score > 0.35 else "LOW"
+    with st.spinner("Calculating Historical Patterns..."):
+        roi = ee.Geometry.Point([lon, lat])
+        trend_data = get_vulnerability_trend(roi)
         
         st.session_state.results = {
-            "score": score, "risk": risk_level, "rain_series": get_rainfall_series(roi),
-            "v_img": vuln, "r_img": rain_img, "zone_1km": zone_1km, "month": month_names[sel_month-1]
+            "trend": trend_data,
+            "current_score": trend_data[4], # Defaulting to May (index 4)
+            "lat": lat, "lon": lon,
+            "roi": roi
         }
 
 # ============================================================
-# RESULTS DISPLAY
+# RESULTS DASHBOARD
 # ============================================================
 if st.session_state.results:
     res = st.session_state.results
+    month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
     
-    # 1. Dashboard Metrics & Graph
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        st.metric("Risk Score", f"{res['score']:.2f}", delta=res['risk'], delta_color="inverse" if res['risk']=="HIGH" else "normal")
-        st.info(f"**Status:** {res['risk']} risk detected for {res['month']}.")
+    # Row 1: Metrics & Graph
+    r1_c1, r1_c2 = st.columns([1, 2])
+    
+    with r1_c1:
+        risk_level = "HIGH" if res['current_score'] > 0.6 else "MODERATE" if res['current_score'] > 0.35 else "LOW"
+        st.metric("Vulnerability Index", f"{res['current_score']:.2f}")
+        st.subheader(f"Status: {risk_level}")
         
-    with c2:
-        st.write("### 📈 2023 Rainfall Trend (mm)")
-        chart_data = pd.DataFrame(res['rain_series'], index=month_names, columns=['Rainfall'])
-        st.line_chart(chart_data)
-
-    # 2. Dual Map System
-    st.markdown("---")
-    m_col1, m_col2 = st.columns(2)
-    
-    with m_col1:
-        st.subheader("🗺️ Regional Vulnerability (5km)")
-        m1 = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=13)
-        v_id = res['v_img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['2dc937', 'e7b416', 'cc3232']})
-        folium.TileLayer(tiles=v_id['tile_fetcher'].url_format, attr='GEE', name='Risk').add_to(m1)
-        st_folium(m1, width="100%", height=400, key="map_reg")
-
-    with m_col2:
-        st.subheader("🎯 Local 1km Risk Zone")
-        m2 = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=15)
-        # Highlight the 1km Zone
-        folium.GeoJson(res['zone_1km'].getInfo(), style_function=lambda x: {'color': '#1B4332', 'fillColor': '#1B4332', 'fillOpacity': 0.1}).add_to(m2)
-        folium.Marker([st.session_state.lat, st.session_state.lon], popup="Your Farm").add_to(m2)
-        st_folium(m2, width="100%", height=400, key="map_local")
-
-    # 3. Dynamic Manual aligned with Result Analysis
-    st.markdown("---")
-    st.subheader(f"📋 Tailored Farming Manual for {res['risk']} Risk Environment")
-    
-    man_col1, man_col2 = st.columns(2)
-    with man_col1:
-        if res['risk'] == "HIGH":
-            st.error("### 🚨 Urgent Action Plan")
-            st.write("- **Drainage:** Evacuate standing water. Create 30cm deep trenches.")
-            st.write("- **Disease Control:** Spray Copper-based fungicides immediately.")
-            st.write("- **Access:** Restrict movement in the 1km zone to prevent soil-borne pathogen spread.")
-        elif res['risk'] == "MODERATE":
-            st.warning("### ⚠️ Preventative Measures")
-            st.write("- **Soil:** Apply Lime/Dolomite to stabilize pH during heavy rains.")
-            st.write("- **Pruning:** Remove yellowing leaves to improve airflow.")
-            st.write("- **Nutrition:** Increase Potash (K) to strengthen rhizome skin.")
+        # Aligned Manual Recommendation
+        if risk_level == "HIGH":
+            st.error("**Urgent Alert:** Implement immediate trenching and apply bio-fungicides.")
+        elif risk_level == "MODERATE":
+            st.warning("**Caution:** Increase scouting to twice weekly. Check for water-soaking.")
         else:
-            st.success("### ✅ Optimization Strategy")
-            st.write("- **Mulching:** Use rice straw to keep soil cool and moist.")
-            st.write("- **Planning:** Ideal time for organic fertilization and weeding.")
-            st.write("- **Storage:** Ensure seed rhizomes are kept in a dry, ventilated area.")
+            st.success("**Stable:** Maintain standard mulching and organic fertilization.")
 
-    with man_col2:
-        st.info("### 🔍 Technical Observation")
-        st.write(f"The analysis for **{res['month']}** suggests a vulnerability score of **{res['score']:.2f}**.")
-        st.write("This is calculated based on the 1km buffer slope and historical rainfall intensity.")
-        st.caption("Data source: CHIRPS Daily Rainfall & SRTM Digital Elevation Model.")
+    with r1_c2:
+        st.write("### 📈 Monthly Vulnerability Pattern (Historical)")
+        df = pd.DataFrame(res['trend'], index=month_names, columns=['Vulnerability Score'])
+        st.line_chart(df, color="#1B4332")
+
+    # Row 2: Maps
+    st.markdown("---")
+    r2_c1, r2_c2 = st.columns(2)
+    
+    with r2_c1:
+        st.subheader("🗺️ Regional Risk (5km)")
+        m_reg = folium.Map(location=[res['lat'], res['lon']], zoom_start=13)
+        folium.Marker([res['lat'], res['lon']]).add_to(m_reg)
+        st_folium(m_reg, width="100%", height=350, key="map_reg")
+
+    with r2_c2:
+        st.subheader("🎯 1km Risk Buffer Zone")
+        m_loc = folium.Map(location=[res['lat'], res['lon']], zoom_start=15)
+        # Create 1km Buffer
+        buffer_zone = res['roi'].buffer(1000).getInfo()
+        folium.GeoJson(buffer_zone, style_function=lambda x: {
+            'color': '#cc3232' if res['current_score'] > 0.6 else '#1B4332',
+            'fillOpacity': 0.2
+        }).add_to(m_loc)
+        folium.Marker([res['lat'], res['lon']]).add_to(m_loc)
+        st_folium(m_loc, width="100%", height=350, key="map_loc")
