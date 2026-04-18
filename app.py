@@ -53,53 +53,51 @@ except Exception as e:
     st.error(f"❌ Connection Error: {e}")
 
 # ============================================================
-# SPEED-OPTIMIZED FUNCTIONS
+# OPTIMIZED ANALYSIS FUNCTIONS (500m Scale)
 # ============================================================
 
-@st.cache_data(ttl=3600) # Cache results for 1 hour to prevent redundant loading
-def fast_analysis(lat, lon, sel_month):
+@st.cache_data(ttl=3600)
+def analyze_500m_zone(lat, lon, sel_month):
     roi = ee.Geometry.Point([lon, lat])
-    zone_1km = roi.buffer(1000)
+    # UPDATED: 500m Buffer
+    zone_500m = roi.buffer(500)
     
-    # 1. Faster Terrain Analysis (30m scale is fine for static DEM)
-    dem = ee.Image('USGS/SRTMGL1_003').clip(zone_1km)
+    # 1. Terrain Analysis
+    dem = ee.Image('USGS/SRTMGL1_003').clip(zone_500m)
     slope = ee.Terrain.slope(dem)
-    slope_val = slope.reduceRegion(ee.Reducer.mean(), zone_1km, 100).get('slope').getInfo() or 0
+    slope_val = slope.reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('slope').getInfo() or 0
     
-    # 2. Optimized Climate & Vulnerability Trend
-    # We fetch a monthly climatology instead of daily filtering to save time
-    rain_col = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD").filterDate('2000-01-01', '2025-12-31')
+    # 2. Historical Climate (2000-2026)
+    # Using Pentad for speed, Monthly Climatology logic
+    rain_col = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD").filterDate('2000-01-01', '2026-12-31')
     
     trend = []
-    month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-    
-    # Pre-calculate climate for selected month for metrics
+    # Pre-calculate climate for metrics
     sel_rain = rain_col.filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).mean()
-    sel_rain_val = sel_rain.reduceRegion(ee.Reducer.mean(), zone_1km, 200).get('precipitation').getInfo() or 0
+    sel_rain_val = sel_rain.reduceRegion(ee.Reducer.mean(), zone_500m, 100).get('precipitation').getInfo() or 0
 
-    # Quick loop using larger scale (200m) for the graph
     for m in range(1, 13):
         m_rain = rain_col.filter(ee.Filter.calendarRange(m, m, 'month')).mean()
-        m_rain_val = m_rain.reduceRegion(ee.Reducer.mean(), zone_1km, 250).get('precipitation').getInfo() or 0
-        # Formula: (SlopeNorm * 0.4) + (RainNorm * 0.6)
-        v_score = (slope_val / 45 * 0.4) + (m_rain_val / 10 * 0.6) # Pentad data scale
+        m_rain_val = m_rain.reduceRegion(ee.Reducer.mean(), zone_500m, 100).get('precipitation').getInfo() or 0
+        v_score = (slope_val / 45 * 0.4) + (m_rain_val / 10 * 0.6)
         trend.append(min(v_score, 1.0))
 
-    # 3. Raster for Map (Current Selection)
-    rain_map = rain_col.filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).mean().clip(zone_1km)
+    # 3. 500m Raster for Map
+    rain_map = rain_col.filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).mean().clip(zone_500m)
     vuln_raster = slope.divide(45).multiply(0.4).add(rain_map.divide(10).multiply(0.6)).rename('vulnerability')
     
-    # 4. LST and Humidity (Historical Mean)
+    # 4. Long-term LST 
     lst_col = ee.ImageCollection("MODIS/061/MOD11A1").filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).select('LST_Day_1km')
-    lst_val = lst_col.mean().multiply(0.02).subtract(273.15).reduceRegion(ee.Reducer.mean(), roi, 1000).get('LST_Day_1km').getInfo() or 0
+    lst_val = lst_col.mean().multiply(0.02).subtract(273.15).reduceRegion(ee.Reducer.mean(), roi, 500).get('LST_Day_1km').getInfo() or 0
     
     return {
         "score": trend[sel_month-1],
         "trend": trend,
         "vuln_img": vuln_raster,
         "lst": lst_val,
-        "hum": (sel_rain_val * 2.5), # Proxy for humidity based on rainfall intensity
-        "risk": "HIGH" if trend[sel_month-1] > 0.55 else "MODERATE" if trend[sel_month-1] > 0.35 else "LOW"
+        "hum": (sel_rain_val * 2.5),
+        "risk": "HIGH" if trend[sel_month-1] > 0.55 else "MODERATE" if trend[sel_month-1] > 0.35 else "LOW",
+        "zone": zone_500m
     }
 
 # ============================================================
@@ -121,7 +119,7 @@ with st.sidebar:
             st.rerun()
 
     month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-    sel_month = st.selectbox("📅 Pattern Month", range(1, 13), index=4, format_func=lambda x: month_names[x-1])
+    sel_month = st.selectbox("📅 Analysis Month", range(1, 13), index=4, format_func=lambda x: month_names[x-1])
     
     test_btn = st.button("🔍 TEST VULNERABILITY", type="primary", use_container_width=True)
 
@@ -129,9 +127,9 @@ with st.sidebar:
 # EXECUTION
 # ============================================================
 if test_btn:
-    with st.spinner("🚀 Speed-optimizing 25-year analysis..."):
+    with st.spinner("Analyzing 500m farm zone patterns..."):
         try:
-            results = fast_analysis(st.session_state.lat, st.session_state.lon, sel_month)
+            results = analyze_500m_zone(st.session_state.lat, st.session_state.lon, sel_month)
             results["month"] = month_names[sel_month-1]
             st.session_state.results = results
         except Exception as e:
@@ -144,21 +142,26 @@ if st.session_state.results:
     res = st.session_state.results
     
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Vulnerability Index", f"{res['score']:.2f}")
+    m1.metric("Local Vulnerability", f"{res['score']:.2f}")
     m2.metric("Long-term LST", f"{res['lst']:.1f}°C")
     m3.metric("Humidity Index", f"{res['hum']:.1f}")
     m4.metric("Risk Level", res['risk'])
 
-    st.write(f"### 📈 Annual Pattern (2000-2025 Average)")
+    st.write(f"### 📈 Annual Pattern (2000-2026 Avg)")
     df = pd.DataFrame(res['trend'], index=month_names, columns=['Risk Score'])
     st.line_chart(df, color="#1B4332")
 
     st.markdown("---")
-    st.subheader("🎯 1km Radius Vulnerability Raster")
-    m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=15)
-    map_id = res['vuln_img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['#2dc937', '#e7b416', '#cc3232']})
-    folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name="Vulnerability").add_to(m)
+    st.subheader("🎯 500m Radius Vulnerability Raster")
+    m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=16) # Zoomed in for 500m
     
+    # Display Raster
+    map_id = res['vuln_img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['#2dc937', '#e7b416', '#cc3232']})
+    folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name="500m Vulnerability").add_to(m)
+    
+    # Display 500m Circle Boundary
+    folium.GeoJson(res['zone'].getInfo(), style_function=lambda x: {'color': '#1B4332', 'fillOpacity': 0.1, 'weight': 2}).add_to(m)
+
     legend_html = '''
      <div style="position: fixed; bottom: 50px; left: 50px; width: 140px; height: 110px; 
      background-color: white; border:2px solid #1B4332; z-index:9999; font-size:14px;
@@ -193,4 +196,4 @@ if st.session_state.results:
         with st.expander("🧪 Field Best Practices"):
             st.write("- Never plant ginger after Tomato or Peppers.")
             st.write("- Treat rhizomes with fungicide before planting.")
-            st.write(f"- Historical LST: {res['lst']:.1f}°C.")
+            st.write(f"- 500m Avg LST: {res['lst']:.1f}°C.")
