@@ -39,9 +39,14 @@ background:#1B4332; padding:15px; border-radius:15px;">
 # ----------------------------------------------------------
 # INIT EARTH ENGINE
 # ----------------------------------------------------------
+# FIX 1: Replace escaped newlines in private_key from Streamlit secrets.
+# Streamlit sometimes stores "\n" as a literal string "\\n" which
+# breaks the PEM key format that Google's auth library expects.
 try:
     if "gcp_service_account" in st.secrets:
-        info = st.secrets["gcp_service_account"]
+        info = dict(st.secrets["gcp_service_account"])
+        # Normalize the private key — replace escaped newlines if present
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
         creds = ee.ServiceAccountCredentials(
             info["client_email"],
             key_data=info["private_key"]
@@ -64,13 +69,13 @@ lat = col1.number_input("Latitude", value=10.73, format="%.4f")
 lon = col2.number_input("Longitude", value=122.54, format="%.4f")
 
 month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-month = col3.selectbox("Month", range(1,13),
-                       format_func=lambda x: month_names[x-1])
+month = col3.selectbox("Month", range(1, 13),
+                       format_func=lambda x: month_names[x - 1])
 
 run = st.button("🚀 Run Analysis")
 
 # ----------------------------------------------------------
-# BUILD IMAGE (SAFE)
+# BUILD IMAGE (FIXED)
 # ----------------------------------------------------------
 def build_vulnerability(lat, lon, month):
     roi = ee.Geometry.Point([lon, lat])
@@ -82,20 +87,25 @@ def build_vulnerability(lat, lon, month):
     start = ee.Date.fromYMD(2023, month, 1)
     end = start.advance(1, 'month')
 
-    rain_col = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(start, end)
-
-    rain = ee.Image(
-        ee.Algorithms.If(
-            rain_col.size().gt(0),
-            rain_col.sum(),
-            ee.Image.constant(0)
-        )
+    # FIX 2: Removed ee.Algorithms.If — it evaluates both branches on the
+    # server and fails when the constant fallback has no matching bands.
+    # Instead, merge a zero-filled constant image so the collection is
+    # never empty before calling .sum().
+    fallback = ee.Image.constant(0).rename('precipitation')
+    rain_col = (
+        ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+        .filterDate(start, end)
+        .select('precipitation')
+        .merge(ee.ImageCollection([fallback]))   # guarantees non-empty
     )
+    rain = rain_col.sum().rename('precipitation')
 
-    vuln = slope.divide(30).multiply(0.3)\
-        .add(rain.divide(500).multiply(0.7))\
-        .rename("vuln")\
+    vuln = (
+        slope.divide(30).multiply(0.3)
+        .add(rain.divide(500).multiply(0.7))
+        .rename("vuln")
         .clip(buffer)
+    )
 
     return vuln, buffer
 
@@ -109,14 +119,16 @@ if run:
         try:
             vuln_img, buffer = build_vulnerability(lat, lon, month)
 
-            # SAFE VALUE EXTRACTION
             score_dict = vuln_img.reduceRegion(
                 reducer=ee.Reducer.mean(),
                 geometry=buffer,
                 scale=100
             ).getInfo()
 
-            score = score_dict.get("vuln", 0.5)
+            # FIX 3: Explicit None guard — .get() can still return None
+            # if the band exists but the reducer produced no valid pixels.
+            raw_score = score_dict.get("vuln")
+            score = float(raw_score) if raw_score is not None else 0.5
 
         except Exception as e:
             st.error("Analysis failed.")
@@ -146,21 +158,40 @@ if run:
             'palette': ['green', 'yellow', 'red']
         }
 
-        map_id = vuln_img.getMapId(vis)
+        map_id_dict = vuln_img.getMapId(vis)
+
+        # FIX 4: Safely retrieve the tile URL — the attribute name changed
+        # across earthengine-api versions. Try url_format first, then
+        # fall back to formatTileUrl for older installs.
+        tile_fetcher = map_id_dict.get('tile_fetcher')
+        if tile_fetcher is not None and hasattr(tile_fetcher, 'url_format'):
+            tile_url = tile_fetcher.url_format
+        elif tile_fetcher is not None and hasattr(tile_fetcher, 'formatTileUrl'):
+            tile_url = tile_fetcher.formatTileUrl(0, 0, 0).rsplit('/', 3)[0] + '/{z}/{x}/{y}'
+        else:
+            # Last resort: reconstruct from mapid + token
+            tile_url = (
+                "https://earthengine.googleapis.com/map/"
+                f"{map_id_dict['mapid']}/{{z}}/{{x}}/{{y}}?token={map_id_dict['token']}"
+            )
 
         folium.TileLayer(
-            tiles=map_id['tile_fetcher'].url_format,
+            tiles=tile_url,
             attr='Google Earth Engine',
-            overlay=True
+            overlay=True,
+            name='Vulnerability'
         ).add_to(m)
 
-        folium.Circle([lat, lon], radius=1000).add_to(m)
+        folium.Circle([lat, lon], radius=1000,
+                      color='blue', fill=False).add_to(m)
+
+        folium.LayerControl().add_to(m)
 
         # LEGEND
         legend = """
         <div style="position: fixed; bottom: 50px; left: 50px;
         background: rgba(0,0,0,0.7); padding:10px;
-        border-radius:8px; color:white;">
+        border-radius:8px; color:white; z-index:1000;">
         <b>Risk Level</b><br>
         🟢 Low<br>
         🟡 Moderate<br>
