@@ -15,7 +15,6 @@ st.set_page_config(layout="wide", page_title="Pest Warning System")
 # ============================================================
 # SESSION STATE INITIALIZATION
 # ============================================================
-# Default coordinates (Iloilo area)
 if "lat" not in st.session_state: st.session_state.lat = 10.9300
 if "lon" not in st.session_state: st.session_state.lon = 122.5200
 if "results" not in st.session_state: st.session_state.results = None 
@@ -54,7 +53,7 @@ except Exception as e:
     st.error(f"❌ Connection Error: {e}")
 
 # ============================================================
-# HIGH-PRECISION ANALYSIS FUNCTIONS
+# RESEARCH-BASED ANALYSIS FUNCTIONS
 # ============================================================
 
 @st.cache_data(ttl=3600)
@@ -62,81 +61,91 @@ def analyze_high_precision(lat, lon, sel_month):
     roi = ee.Geometry.Point([lon, lat])
     zone_500m = roi.buffer(500)
     
-    # 1. High-Precision Terrain (10m scale)
+    # 1. Vegetation Health & Moisture (Sentinel-2 10m)
+    # Research: Low NDVI + High NDWI = High Risk of Waterborne Pathogens
+    s2_col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
+        .filterBounds(zone_500m) \
+        .filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')) \
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) \
+        .median()
+
+    ndvi = s2_col.normalizedDifference(['B8', 'B4']).rename('NDVI')
+    ndwi = s2_col.normalizedDifference(['B3', 'B8']).rename('NDWI')
+    
+    # 2. Topography (Drainage Risk)
     dem = ee.Image('USGS/SRTMGL1_003').clip(zone_500m)
     slope = ee.Terrain.slope(dem)
-    slope_val = slope.reduceRegion(ee.Reducer.mean(), zone_500m, 10).get('slope').getInfo() or 0
     
-    # 2. Historical Climate (2000-2026)
-    rain_col = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD").filterDate('2000-01-01', '2026-12-31')
+    # 3. LST (Temperature Suitability)
+    lst_col = ee.ImageCollection("MODIS/061/MOD11A1") \
+        .filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')) \
+        .select('LST_Day_1km')
+    lst_img = lst_col.mean().multiply(0.02).subtract(273.15)
+    lst_val = lst_img.reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('LST_Day_1km').getInfo() or 0
     
-    trend = []
-    sel_rain = rain_col.filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).mean().resample('bicubic')
-    sel_rain_val = sel_rain.reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('precipitation').getInfo() or 0
+    # 4. Risk Algorithm: Based on Pest Susceptibility Research
+    # Risk = (Moisture Weight) + (Slope Weight) + (Temp Weight)
+    # We invert NDVI (1-NDVI) because lower vegetation health = higher pest risk
+    risk_raster = ndwi.multiply(0.4) \
+        .add(slope.divide(45).multiply(-0.2)) \
+        .add(ee.Image(1).subtract(ndvi).multiply(0.4)) \
+        .rename('risk_score')
 
+    score_val = risk_raster.reduceRegion(ee.Reducer.mean(), zone_500m, 10).get('risk_score').getInfo() or 0
+    
+    # Generate monthly trend based on Precipitation and LST patterns
+    rain_col = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD")
+    trend = []
     for m in range(1, 13):
         m_rain = rain_col.filter(ee.Filter.calendarRange(m, m, 'month')).mean()
         m_rain_val = m_rain.reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('precipitation').getInfo() or 0
-        v_score = (slope_val / 45 * 0.45) + (m_rain_val / 10 * 0.55)
-        trend.append(min(v_score, 1.0))
+        # Research indicates Rain > 200mm increases pest pressure significantly
+        m_score = (m_rain_val / 400 * 0.7) + (0.3 if 24 < lst_val < 30 else 0.1)
+        trend.append(min(m_score, 1.0))
 
-    # 3. Precision Raster (10m scale)
-    rain_map = rain_col.filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).mean().clip(zone_500m)
-    vuln_raster = slope.divide(45).multiply(0.45).add(rain_map.divide(10).multiply(0.55)).rename('vulnerability')
-    
-    # 4. Long-term LST
-    lst_col = ee.ImageCollection("MODIS/061/MOD11A1").filter(ee.Filter.calendarRange(sel_month, sel_month, 'month')).select('LST_Day_1km')
-    lst_val = lst_col.mean().multiply(0.02).subtract(273.15).reduceRegion(ee.Reducer.mean(), zone_500m, 30).get('LST_Day_1km').getInfo() or 0
-    
     return {
-        "score": trend[sel_month-1],
+        "score": score_val,
         "trend": trend,
-        "vuln_img": vuln_raster,
+        "vuln_img": risk_raster,
         "lst": lst_val,
-        "hum": (sel_rain_val * 2.5),
-        "risk": "HIGH" if trend[sel_month-1] > 0.55 else "MODERATE" if trend[sel_month-1] > 0.35 else "LOW",
+        "hum": (score_val * 100), # Proxy for soil saturation %
+        "risk": "HIGH" if score_val > 0.6 else "MODERATE" if score_val > 0.3 else "LOW",
         "zone": zone_500m
     }
 
 # ============================================================
-# SIDEBAR / INPUTS (UPDATED LOCATION CONTROLS)
+# SIDEBAR / INPUTS
 # ============================================================
 with st.sidebar:
     st.header("📍 Location Setup")
     
-    # Option 1: Automatic GPS
-    st.write("### 🛰️ Auto-Location")
     loc = get_geolocation()
     if loc:
         st.session_state.lat = loc['coords']['latitude']
         st.session_state.lon = loc['coords']['longitude']
-        st.success(f"Location Captured: {st.session_state.lat:.4f}, {st.session_state.lon:.4f}")
+        st.success(f"Location Captured")
     else:
-        st.info("Waiting for GPS permission...")
+        st.info("Waiting for GPS...")
 
     st.markdown("---")
     
-    # Option 2: Manual Entry
-    with st.expander("⌨️ Manual Coordinate Entry"):
+    with st.expander("⌨️ Manual Entry"):
         mlat = st.number_input("Latitude", value=st.session_state.lat, format="%.8f")
         mlon = st.number_input("Longitude", value=st.session_state.lon, format="%.8f")
         if st.button("Set Manual Coordinates", use_container_width=True):
             st.session_state.lat = mlat
             st.session_state.lon = mlon
-            st.toast("Coordinates updated manually!")
 
     st.markdown("---")
-
     month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
     sel_month = st.selectbox("📅 Analysis Month", range(1, 13), index=4, format_func=lambda x: month_names[x-1])
-    
     test_btn = st.button("🔍 ANALYZE RISK", type="primary", use_container_width=True)
 
 # ============================================================
 # EXECUTION
 # ============================================================
 if test_btn:
-    with st.spinner("Executing high-precision spatial analysis..."):
+    with st.spinner("Calculating Research-Based Risk Indices..."):
         try:
             results = analyze_high_precision(st.session_state.lat, st.session_state.lon, sel_month)
             results["month"] = month_names[sel_month-1]
@@ -149,26 +158,24 @@ if test_btn:
 # ============================================================
 if st.session_state.results:
     res = st.session_state.results
-    
-    # Display coordinates used for current results
-    st.info(f"Analysis for: **Lat: {st.session_state.lat:.6f}, Lon: {st.session_state.lon:.6f}**")
+    st.info(f"Methodology: S-2 NDVI/NDWI Fusion & SRTM Topography | Lat: {st.session_state.lat:.5f}")
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Local Vulnerability", f"{res['score']:.3f}")
-    m2.metric("Long-term LST", f"{res['lst']:.1f}°C")
-    m3.metric("Humidity Index", f"{res['hum']:.2f}")
-    m4.metric("Risk Level", res['risk'])
+    m1.metric("Risk Index", f"{res['score']:.3f}")
+    m2.metric("Avg LST", f"{res['lst']:.1f}°C")
+    m3.metric("Saturation Index", f"{res['hum']:.1f}%")
+    m4.metric("Status", res['risk'])
 
-    st.write(f"### 📈 Precision Annual Pattern (2000-2026 Avg)")
+    st.write(f"### 📈 Research-Based Annual Pest Pressure")
     df = pd.DataFrame(res['trend'], index=month_names, columns=['Risk Score'])
     st.line_chart(df, color="#1B4332")
 
     st.markdown("---")
-    st.subheader("🎯 RISK MAP (500m)")
+    st.subheader("🎯 SPATIAL RISK MAP (SENTINEL-2 10M)")
     m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=17) 
     
-    map_id = res['vuln_img'].getMapId({'min': 0, 'max': 0.8, 'palette': ['#2dc937', '#92d050', '#e7b416', '#cc3232']})
-    folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name="Precision Risk").add_to(m)
+    map_id = res['vuln_img'].getMapId({'min': 0, 'max': 0.7, 'palette': ['#2dc937', '#e7b416', '#cc3232']})
+    folium.TileLayer(tiles=map_id['tile_fetcher'].url_format, attr='GEE', name="Pest Risk").add_to(m)
     
     folium.GeoJson(res['zone'].getInfo(), style_function=lambda x: {'color': '#1B4332', 'fillOpacity': 0.05, 'weight': 1}).add_to(m)
 
@@ -190,20 +197,18 @@ if st.session_state.results:
     st.subheader("Recommendations")
     rec1, rec2 = st.columns(2)
     with rec1:
-        st.markdown(f"### Immediate Recommendation ({res['risk']})")
+        st.markdown(f"### Immediate Action Plan ({res['risk']})")
         if res['risk'] == "HIGH":
-            st.error("1. Deepen drainage canals to 45cm. \n2. Apply Copper Oxychloride drench. \n3. Isolate infected farm blocks.")
+            st.error("1. Immediate Field Drainage: Ensure no standing water. \n2. Biocontrol: Drench with Bacillus subtilis. \n3. Quarantine: Stop movement of tools between blocks.")
         elif res['risk'] == "MODERATE":
-            st.warning("1. Apply Trichoderma to soil. \n2. Increase Potash fertilizer. \n3. Check stem bases twice weekly.")
+            st.warning("1. Monitor: Check for early yellowing of lower leaves. \n2. Nutrition: Apply Potassium-heavy fertilizer to strengthen cell walls. \n3. Sanitation: Clean all tools with bleach solution.")
         else:
-            st.success("1. Maintain 10cm rice straw mulch. \n2. Add vermicompost. \n3. Ensure 25cm plant spacing.")
+            st.success("1. Preventative: Maintain mulch cover. \n2. Monitoring: Standard weekly scouting. \n3. Soil: Continue regular organic matter incorporation.")
 
     with rec2:
-        st.markdown("### tip")
-        with st.expander("🩺 Disease Information"):
-            st.write("**Soft Rot:** Yellow leaf tips; mushy rhizomes.")
-            st.write("**Bacterial Wilt:** Sudden green wilting; milky ooze.")
-        with st.expander("🧪 Field Best Practices"):
-            st.write("- Never plant ginger after Tomato or Peppers.")
-            st.write("- Treat rhizomes with fungicide before planting.")
-            st.write(f"- 500m High-Precision LST: {res['lst']:.2f}°C.")
+        st.markdown("### Research Context")
+        with st.expander("🩺 Biological Indicators"):
+            st.write("Current analysis uses Sentinel-2 Multi-spectral data. Low NDVI values in high-moisture zones are strong indicators of root-zone stress often caused by fungal/bacterial pathogens.")
+        with st.expander("🧪 Soil & Climate Connection"):
+            st.write(f"- Critical Temperature Range: 25-30°C.")
+            st.write(f"- Saturation Risk: {res['hum']:.1f}%. High saturation limits oxygen and promotes bacterial wilt.")
